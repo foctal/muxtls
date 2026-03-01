@@ -1,4 +1,9 @@
-# muxtls
+[crates-badge]: https://img.shields.io/crates/v/muxtls.svg
+[crates-url]: https://crates.io/crates/muxtls
+[doc-url]: https://docs.rs/muxtls/latest/muxtls
+[license-badge]: https://img.shields.io/crates/l/muxtls.svg
+
+# muxtls [![Crates.io][crates-badge]][crates-url] ![License][license-badge]
 
 Multiplexed streams over TLS/TCP
 
@@ -19,6 +24,15 @@ Multiplexed streams over TLS/TCP
   - TLS over TCP endpoint/connection/stream runtime
   - Stream multiplexing and bounded-memory backpressure
   - Depends on `muxtls-proto` for wire format
+
+## Quick start
+
+```toml
+[dependencies]
+muxtls = "0.1"
+```
+
+API documentation is available on [docs.rs][doc-url].  
 
 ## Wire Format Overview
 `muxtls` uses length-delimited frames, and each frame payload is encoded by `muxtls-proto`.
