@@ -1,0 +1,15 @@
+[package]
+name = "muxtls-proto"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Wire protocol definitions and codec for muxtls"
+repository = "https://github.com/foctal/muxtls"
+readme = "../README.md"
+keywords = ["network", "protocol"]
+categories = ["network-programming"]
+license = "MIT"
+
+[dependencies]
+bytes.workspace = true
+thiserror.workspace = true

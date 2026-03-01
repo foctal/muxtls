@@ -1,0 +1,42 @@
+[package]
+name = "muxtls"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Multiplexed streams over TLS/TCP"
+repository = "https://github.com/foctal/muxtls"
+readme = "../README.md"
+keywords = ["network", "tls", "stream", "multiplexing"]
+categories = ["network-programming", "asynchronous"]
+license = "MIT"
+
+[features]
+default = []
+platform-verifier = ["dep:rustls-platform-verifier"]
+
+[dependencies]
+bytes.workspace = true
+socket2.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+rustls.workspace = true
+rustls-native-certs.workspace = true
+rustls-platform-verifier = { workspace = true, optional = true }
+rcgen.workspace = true
+rustls-pemfile.workspace = true
+futures-util.workspace = true
+futures-core.workspace = true
+futures-sink.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+muxtls-proto.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "macros", "net", "io-util", "time"] }
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+[[bench]]
+name = "throughput"
+harness = false
