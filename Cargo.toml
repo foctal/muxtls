@@ -23,4 +23,4 @@ futures-sink = "0.3"
 tokio-util = { version = "0.7", features = ["codec"] }
 tracing = "0.1"
 thiserror = "2"
-muxtls-proto = { path = "muxtls-proto" }
+muxtls-proto = { path = "muxtls-proto", version = "0.1.0" }
