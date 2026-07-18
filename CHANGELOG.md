@@ -15,6 +15,8 @@ All notable changes to this project are documented in this file.
 - Malformed-frame, shutdown, timeout, reset, and large-write tests.
 - A standalone version 1 protocol specification and machine-readable
   conformance vectors.
+- Coverage-guided fuzz targets for variable-length integers, frames, and
+  connection state transitions.
 
 ### Changed
 

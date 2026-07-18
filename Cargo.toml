@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["muxtls-proto", "muxtls"]
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.2.0"

@@ -1,0 +1,39 @@
+[package]
+name = "muxtls-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+rust-version = "1.88"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+bytes = "1"
+libfuzzer-sys = { version = "0.4.13", features = ["arbitrary-derive"] }
+muxtls = { path = "../muxtls", features = ["fuzzing"] }
+muxtls-proto = { path = "../muxtls-proto" }
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "varint_decode"
+path = "fuzz_targets/varint_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "frame_decode"
+path = "fuzz_targets/frame_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "connection_state"
+path = "fuzz_targets/connection_state.rs"
+test = false
+doc = false
+bench = false

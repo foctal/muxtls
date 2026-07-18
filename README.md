@@ -67,3 +67,8 @@ Supported frame types:
 The examples generate and bypass verification of a development certificate.
 Use `ServerConfig::from_pem_files` and `ClientConfig::with_native_roots` (or
 explicit custom roots) in deployed services.
+
+## Fuzzing
+
+Coverage-guided fuzz targets for protocol decoding and connection state
+transitions are documented in [`fuzz/README.md`](fuzz/README.md).

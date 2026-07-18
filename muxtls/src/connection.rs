@@ -1021,6 +1021,47 @@ fn ensure_peer_send_open(state: &StreamState, stream_id: u64, frame: &str) -> Re
     }
 }
 
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub fn fuzz_connection_state(is_client: bool, frames: &[Vec<u8>]) {
+    use tokio::io::AsyncWriteExt;
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("fuzz runtime");
+
+    runtime.block_on(async {
+        let (transport, mut peer) = tokio::io::duplex(128 * 1024);
+        let limits = Limits {
+            max_frame_size: 1024,
+            max_open_streams: 16,
+            max_inbound_connection_bytes: 4096,
+            max_outbound_connection_bytes: 4096,
+            max_inbound_stream_bytes: 512,
+            max_outbound_stream_bytes: 512,
+        };
+        let connection =
+            Connection::new(transport, limits, is_client, None, None).expect("fuzz connection");
+
+        for frame in frames.iter().take(64) {
+            let Ok(frame_len) = u32::try_from(frame.len()) else {
+                continue;
+            };
+            if peer.write_all(&frame_len.to_be_bytes()).await.is_err()
+                || peer.write_all(frame).await.is_err()
+            {
+                break;
+            }
+        }
+        drop(peer);
+
+        tokio::time::timeout(Duration::from_secs(1), connection.wait_closed())
+            .await
+            .expect("connection tasks must terminate after transport EOF");
+    });
+}
+
 fn spawn_connection_tasks(
     stream: BoxIo,
     shared: Arc<ConnectionShared>,

@@ -1,0 +1,39 @@
+name: Fuzz
+
+on:
+  pull_request:
+    branches: ["main"]
+  push:
+    branches: ["main"]
+  schedule:
+    - cron: "17 3 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - varint_decode
+          - frame_decode
+          - connection_state
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz -> target
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --version 0.13.1 --locked
+      - name: Build fuzz target
+        run: cargo +nightly fuzz build ${{ matrix.target }}
+      - name: Smoke-test fuzz target
+        run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=30

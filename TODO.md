@@ -40,7 +40,7 @@ the library should be used across an untrusted network boundary.
   the four-byte length prefix, stream ID rules, state transitions, error codes,
   and compatibility policy.
 - [x] Add protocol conformance vectors shared with any non-Rust implementation.
-- [ ] Add coverage-guided fuzzing for `VarInt::decode`, `Frame::decode`, and
+- [x] Add coverage-guided fuzzing for `VarInt::decode`, `Frame::decode`, and
   connection state transitions.
 - [x] Add opt-in keepalive and inbound idle-timeout policies. Endpoints can
   schedule `PING` frames and close connections that receive no frames within a

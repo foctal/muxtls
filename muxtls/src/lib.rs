@@ -45,3 +45,7 @@ pub use endpoint::{Connecting, Endpoint};
 pub use error::{Error, Result};
 pub use limits::Limits;
 pub use stream::{RecvStream, SendStream};
+
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub use connection::fuzz_connection_state;

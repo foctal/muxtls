@@ -15,6 +15,7 @@ license.workspace = true
 [features]
 default = []
 platform-verifier = ["dep:rustls-platform-verifier"]
+fuzzing = []
 
 [dependencies]
 bytes.workspace = true
