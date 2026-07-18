@@ -184,13 +184,7 @@ impl Connection {
             .await
             .map_err(|_| Error::ConnectionClosed)?;
 
-        let stream_id = self
-            .shared
-            .next_local_stream_id
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |id| {
-                id.checked_add(2).filter(|next| *next <= VarInt::MAX)
-            })
-            .map_err(|_| Error::StreamIdExhausted)?;
+        let stream_id = take_stream_id(&self.shared.next_local_stream_id)?;
 
         let state = Arc::new(StreamState::new(
             self.shared.limits.max_inbound_stream_bytes,
@@ -562,6 +556,8 @@ impl ConnectionShared {
             .cloned()
             .ok_or_else(|| Error::Protocol(format!("data for unknown stream id {stream_id}")))?;
 
+        ensure_peer_send_open(&state, stream_id, "stream frame")?;
+
         if !payload.is_empty() {
             state.push_inbound(self, payload).await?;
         }
@@ -583,6 +579,8 @@ impl ConnectionShared {
             .cloned()
             .ok_or_else(|| Error::Protocol(format!("reset for unknown stream id {stream_id}")))?;
 
+        ensure_peer_send_open(&state, stream_id, "reset")?;
+
         state.mark_reset(error_code).await;
         state.mark_recv_terminal().await;
         self.try_retire_stream(stream_id).await;
@@ -602,10 +600,7 @@ impl ConnectionShared {
                 "expected peer stream id {next_expected}, received {stream_id}"
             )));
         }
-        let next = stream_id.checked_add(2).ok_or(Error::StreamIdExhausted)?;
-        if next > VarInt::MAX {
-            return Err(Error::StreamIdExhausted);
-        }
+        let next = stream_id + 2;
 
         let permit = self
             .open_streams
@@ -1008,6 +1003,24 @@ impl StreamState {
     }
 }
 
+fn take_stream_id(next_stream_id: &AtomicU64) -> Result<u64> {
+    next_stream_id
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |id| {
+            (id <= VarInt::MAX).then_some(id + 2)
+        })
+        .map_err(|_| Error::StreamIdExhausted)
+}
+
+fn ensure_peer_send_open(state: &StreamState, stream_id: u64, frame: &str) -> Result<()> {
+    if state.recv_terminal.load(Ordering::Acquire) {
+        Err(Error::Protocol(format!(
+            "{frame} after peer send side closed for stream id {stream_id}"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
 fn spawn_connection_tasks(
     stream: BoxIo,
     shared: Arc<ConnectionShared>,
@@ -1164,4 +1177,58 @@ async fn handle_incoming_frame(shared: Arc<ConnectionShared>, bytes: BytesMut) -
     }
 
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicU64;
+
+    use muxtls_proto::VarInt;
+
+    use super::{StreamState, ensure_peer_send_open, take_stream_id};
+    use crate::Error;
+
+    #[test]
+    fn final_representable_stream_ids_can_be_allocated() {
+        let even = AtomicU64::new(VarInt::MAX - 1);
+        assert_eq!(
+            take_stream_id(&even).expect("final even stream id"),
+            VarInt::MAX - 1
+        );
+        assert!(matches!(
+            take_stream_id(&even),
+            Err(Error::StreamIdExhausted)
+        ));
+
+        let odd = AtomicU64::new(VarInt::MAX);
+        assert_eq!(
+            take_stream_id(&odd).expect("final odd stream id"),
+            VarInt::MAX
+        );
+        assert!(matches!(
+            take_stream_id(&odd),
+            Err(Error::StreamIdExhausted)
+        ));
+    }
+
+    #[tokio::test]
+    async fn frames_after_peer_send_terminal_are_rejected() {
+        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = semaphore.acquire_owned().await.expect("stream permit");
+        let state = StreamState::new(1, 1, permit);
+
+        ensure_peer_send_open(&state, 7, "stream frame").expect("open receive direction");
+        state
+            .recv_terminal
+            .store(true, std::sync::atomic::Ordering::Release);
+
+        let stream_error =
+            ensure_peer_send_open(&state, 7, "stream frame").expect_err("frame after FIN");
+        assert!(
+            matches!(stream_error, Error::Protocol(message) if message.contains("stream frame"))
+        );
+
+        let reset_error = ensure_peer_send_open(&state, 7, "reset").expect_err("reset after FIN");
+        assert!(matches!(reset_error, Error::Protocol(message) if message.contains("reset")));
+    }
 }
