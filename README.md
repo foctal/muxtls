@@ -7,8 +7,15 @@
 
 Multiplexed streams over TLS/TCP
 
+> **Status:** The runtime has bounded buffers, strict protocol validation, ALPN,
+> and connection/handshake shutdown handling. Review the remaining release
+> gates in
+> [`TODO.md`](https://github.com/foctal/muxtls/blob/main/TODO.md) before exposing
+> it to untrusted Internet peers.
+
 ## Features
 - TLS-secured client/server transport using `rustls` + `tokio-rustls`
+- Protocol isolation through the `muxtls/1` ALPN identifier
 - Multiple independent bidirectional logical streams over one TLS/TCP connection
 - Bounded-memory runtime with per-frame, per-stream, and per-connection limits
 - Stream-oriented API with async backpressure
@@ -29,15 +36,19 @@ Multiplexed streams over TLS/TCP
 
 ```toml
 [dependencies]
-muxtls = "0.1"
+muxtls = "0.2"
 ```
 
 API documentation is available on [docs.rs][doc-url].  
 
 ## Wire Format Overview
-`muxtls` uses length-delimited frames, and each frame payload is encoded by `muxtls-proto`.
+
+`muxtls` uses a four-byte big-endian length prefix followed by a frame encoded
+by `muxtls-proto`. Client-initiated stream IDs are even, server-initiated stream
+IDs are odd, and each side announces IDs monotonically with `OPEN_STREAM`.
 
 Supported frame types:
+- `OPEN_STREAM`
 - `STREAM`
 - `RESET_STREAM`
 - `PING`
@@ -46,3 +57,7 @@ Supported frame types:
 ## Examples
 - `cargo run -p muxtls --example echo_server`
 - `cargo run -p muxtls --example echo_client`
+
+The examples generate and bypass verification of a development certificate.
+Use `ServerConfig::from_pem_files` and `ClientConfig::with_native_roots` (or
+explicit custom roots) in deployed services.
