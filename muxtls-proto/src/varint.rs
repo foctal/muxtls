@@ -24,6 +24,16 @@ impl VarInt {
         self.0
     }
 
+    /// Returns the number of bytes used by the canonical encoding.
+    pub const fn encoded_len(self) -> usize {
+        match self.0 {
+            0..=0x3f => 1,
+            0x40..=0x3fff => 2,
+            0x4000..=0x3fff_ffff => 4,
+            _ => 8,
+        }
+    }
+
     /// Encodes this value to the destination buffer.
     pub fn encode(self, out: &mut impl BufMut) {
         let v = self.0;
@@ -44,27 +54,37 @@ impl VarInt {
             return Err(VarIntError::UnexpectedEof);
         }
 
-        let first = src.chunk()[0];
+        let first = src.get_u8();
         let tag = first >> 6;
         let value = match tag {
-            0 => (src.get_u8() & 0x3f) as u64,
+            0 => (first & 0x3f) as u64,
             1 => {
-                if src.remaining() < 2 {
+                if src.remaining() < 1 {
                     return Err(VarIntError::UnexpectedEof);
                 }
-                (src.get_u16() & 0x3fff) as u64
+                (((first & 0x3f) as u64) << 8) | src.get_u8() as u64
             }
             2 => {
-                if src.remaining() < 4 {
+                if src.remaining() < 3 {
                     return Err(VarIntError::UnexpectedEof);
                 }
-                (src.get_u32() & 0x3fff_ffff) as u64
+                (((first & 0x3f) as u64) << 24)
+                    | ((src.get_u8() as u64) << 16)
+                    | ((src.get_u8() as u64) << 8)
+                    | src.get_u8() as u64
             }
             _ => {
-                if src.remaining() < 8 {
+                if src.remaining() < 7 {
                     return Err(VarIntError::UnexpectedEof);
                 }
-                src.get_u64() & 0x3fff_ffff_ffff_ffff
+                (((first & 0x3f) as u64) << 56)
+                    | ((src.get_u8() as u64) << 48)
+                    | ((src.get_u8() as u64) << 40)
+                    | ((src.get_u8() as u64) << 32)
+                    | ((src.get_u8() as u64) << 24)
+                    | ((src.get_u8() as u64) << 16)
+                    | ((src.get_u8() as u64) << 8)
+                    | src.get_u8() as u64
             }
         };
 
@@ -154,5 +174,20 @@ mod tests {
     fn overflow_is_error() {
         let err = VarInt::from_u64(VarInt::MAX + 1).expect_err("overflow must fail");
         assert_eq!(err, VarIntError::ValueTooLarge(VarInt::MAX + 1));
+    }
+
+    #[test]
+    fn truncated_encodings_are_errors() {
+        for encoded in [
+            &[0x40][..],
+            &[0x80, 0, 0][..],
+            &[0xc0, 0, 0, 0, 0, 0, 0][..],
+        ] {
+            let mut encoded = bytes::Bytes::copy_from_slice(encoded);
+            assert_eq!(
+                VarInt::decode(&mut encoded),
+                Err(VarIntError::UnexpectedEof)
+            );
+        }
     }
 }

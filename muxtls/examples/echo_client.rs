@@ -20,8 +20,6 @@ async fn main() -> muxtls::Result<()> {
     }
 
     connection.close("client done").await?;
-    // Wait for the connection to be fully closed before exiting.
-    // Sleeping for a short time is a simple way to achieve this in this example.
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    connection.wait_closed().await;
     Ok(())
 }

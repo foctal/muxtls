@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Wire protocol primitives for muxtls.
 //!
 //! This crate contains transport-independent protocol definitions:

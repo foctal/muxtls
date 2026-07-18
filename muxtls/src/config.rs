@@ -11,6 +11,8 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 
 use crate::error::{Error, Result};
 
+pub(crate) const ALPN_PROTOCOL: &[u8] = b"muxtls/1";
+
 /// Client-side TLS configuration wrapper.
 #[derive(Clone)]
 pub struct ClientConfig {
@@ -31,10 +33,27 @@ impl ClientConfig {
         for cert in cert_result.certs {
             roots.add(cert).map_err(|e| Error::Config(e.to_string()))?;
         }
+        if roots.is_empty() {
+            let details = cert_result
+                .errors
+                .first()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "the platform returned no certificates".to_owned());
+            return Err(Error::Config(format!(
+                "no usable native root certificates: {details}"
+            )));
+        }
+        if !cert_result.errors.is_empty() {
+            tracing::warn!(
+                errors = cert_result.errors.len(),
+                "some native root certificates could not be loaded"
+            );
+        }
 
-        let config = rustls::ClientConfig::builder()
+        let mut config = rustls::ClientConfig::builder()
             .with_root_certificates(roots)
             .with_no_client_auth();
+        config.alpn_protocols = vec![ALPN_PROTOCOL.to_vec()];
 
         Ok(Self {
             inner: Arc::new(config),
@@ -46,10 +65,11 @@ impl ClientConfig {
     pub fn with_platform_verifier() -> Result<Self> {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let verifier = rustls_platform_verifier::Verifier::new(provider)?;
-        let config = rustls::ClientConfig::builder()
+        let mut config = rustls::ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(verifier))
             .with_no_client_auth();
+        config.alpn_protocols = vec![ALPN_PROTOCOL.to_vec()];
 
         Ok(Self {
             inner: Arc::new(config),
@@ -58,10 +78,11 @@ impl ClientConfig {
 
     /// Builds an insecure testing-only client config that skips certificate verification.
     pub fn dangerous_insecure_no_verify_for_testing() -> Self {
-        let config = rustls::ClientConfig::builder()
+        let mut config = rustls::ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(InsecureNoVerify))
             .with_no_client_auth();
+        config.alpn_protocols = vec![ALPN_PROTOCOL.to_vec()];
 
         Self {
             inner: Arc::new(config),
@@ -70,14 +91,20 @@ impl ClientConfig {
 
     /// Creates a client config that trusts one or more custom root certificates.
     pub fn with_custom_roots(certs: Vec<CertificateDer<'static>>) -> Result<Self> {
+        if certs.is_empty() {
+            return Err(Error::Config(
+                "at least one custom root certificate is required".to_owned(),
+            ));
+        }
         let mut roots = rustls::RootCertStore::empty();
         for cert in certs {
             roots.add(cert).map_err(|e| Error::Config(e.to_string()))?;
         }
 
-        let config = rustls::ClientConfig::builder()
+        let mut config = rustls::ClientConfig::builder()
             .with_root_certificates(roots)
             .with_no_client_auth();
+        config.alpn_protocols = vec![ALPN_PROTOCOL.to_vec()];
 
         Ok(Self {
             inner: Arc::new(config),
@@ -117,10 +144,16 @@ impl ServerConfig {
         certs: Vec<CertificateDer<'static>>,
         key: PrivateKeyDer<'static>,
     ) -> Result<Self> {
-        let config = rustls::ServerConfig::builder()
+        if certs.is_empty() {
+            return Err(Error::Config(
+                "at least one server certificate is required".to_owned(),
+            ));
+        }
+        let mut config = rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(certs, key)
             .map_err(|e| Error::Config(e.to_string()))?;
+        config.alpn_protocols = vec![ALPN_PROTOCOL.to_vec()];
 
         Ok(Self {
             inner: Arc::new(config),

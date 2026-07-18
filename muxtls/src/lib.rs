@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! `muxtls` provides multiplexed bidirectional streams over TLS/TCP.
 //!
 //! The crate offers a small async transport API:

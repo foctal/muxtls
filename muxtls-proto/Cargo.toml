@@ -3,12 +3,14 @@ name = "muxtls-proto"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
+rust-version.workspace = true
 description = "Wire protocol definitions and codec for muxtls"
-repository = "https://github.com/foctal/muxtls"
+repository.workspace = true
+homepage.workspace = true
 readme = "../README.md"
 keywords = ["network", "protocol"]
 categories = ["network-programming"]
-license = "MIT"
+license.workspace = true
 
 [dependencies]
 bytes.workspace = true

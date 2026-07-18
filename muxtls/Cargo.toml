@@ -3,12 +3,14 @@ name = "muxtls"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
+rust-version.workspace = true
 description = "Multiplexed streams over TLS/TCP"
-repository = "https://github.com/foctal/muxtls"
+repository.workspace = true
+homepage.workspace = true
 readme = "../README.md"
 keywords = ["network", "tls", "stream", "multiplexing"]
 categories = ["network-programming", "asynchronous"]
-license = "MIT"
+license.workspace = true
 
 [features]
 default = []
@@ -16,7 +18,6 @@ platform-verifier = ["dep:rustls-platform-verifier"]
 
 [dependencies]
 bytes.workspace = true
-socket2.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true
 rustls.workspace = true
@@ -25,8 +26,6 @@ rustls-platform-verifier = { workspace = true, optional = true }
 rcgen.workspace = true
 rustls-pemfile.workspace = true
 futures-util.workspace = true
-futures-core.workspace = true
-futures-sink.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 thiserror.workspace = true

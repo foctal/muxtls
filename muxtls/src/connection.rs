@@ -21,15 +21,22 @@ type BoxIo = Box<dyn IoStream + Unpin + Send + 'static>;
 /// Runtime statistics for a connection.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ConnectionStats {
+    /// Total locally and remotely initiated streams observed.
     pub opened_streams: u64,
+    /// Successfully encoded frames handed to the transport.
     pub frames_sent: u64,
+    /// Length-delimited frames received from the transport.
     pub frames_received: u64,
+    /// Encoded frame bytes sent, excluding length prefixes and TLS overhead.
     pub bytes_sent: u64,
+    /// Encoded frame bytes received, excluding length prefixes and TLS overhead.
     pub bytes_received: u64,
 }
 
 /// A live multiplexed TLS/TCP connection.
-#[derive(Clone)]
+///
+/// Dropping the last `Connection` handle initiates connection shutdown. Keep a
+/// handle alive while using any streams created from it.
 pub struct Connection {
     pub(crate) shared: Arc<ConnectionShared>,
 }
@@ -38,11 +45,14 @@ pub(crate) struct ConnectionShared {
     pub(crate) limits: Limits,
     pub(crate) local_parity: u64,
     pub(crate) next_local_stream_id: AtomicU64,
+    pub(crate) next_remote_stream_id: AtomicU64,
+    pub(crate) open_lock: Mutex<()>,
     pub(crate) streams: Mutex<HashMap<u64, Arc<StreamState>>>,
     pub(crate) incoming_stream_tx: mpsc::Sender<u64>,
     pub(crate) incoming_stream_rx: Mutex<mpsc::Receiver<u64>>,
     pub(crate) writer: Arc<WriterState>,
     pub(crate) closed: AtomicBool,
+    pub(crate) terminated: AtomicBool,
     pub(crate) close_notify: Notify,
     pub(crate) open_streams: Arc<Semaphore>,
     pub(crate) inbound_conn_bytes: Arc<Semaphore>,
@@ -52,6 +62,7 @@ pub(crate) struct ConnectionShared {
     pub(crate) stats_frames_received: AtomicU64,
     pub(crate) stats_bytes_sent: AtomicU64,
     pub(crate) stats_bytes_received: AtomicU64,
+    pub(crate) connection_handles: AtomicUsize,
 }
 
 pub(crate) struct StreamState {
@@ -59,8 +70,10 @@ pub(crate) struct StreamState {
     inbound_notify: Notify,
     inbound_stream_bytes: Arc<Semaphore>,
     outbound_stream_bytes: Arc<Semaphore>,
+    send_lock: Mutex<()>,
     send_terminal: AtomicBool,
     recv_terminal: AtomicBool,
+    recv_discarded: AtomicBool,
     send_handles: AtomicUsize,
     recv_handles: AtomicUsize,
     open_permit: Mutex<Option<OwnedSemaphorePermit>>,
@@ -70,6 +83,7 @@ struct InboundState {
     chunks: VecDeque<InboundChunk>,
     reset_error: Option<u64>,
     fin_received: bool,
+    connection_closed: bool,
 }
 
 struct InboundChunk {
@@ -90,6 +104,8 @@ struct WriterQueues {
     by_stream: HashMap<u64, VecDeque<OutboundChunk>>,
     ready: VecDeque<u64>,
     control: VecDeque<Frame>,
+    close_frame: Option<Frame>,
+    graceful_close: bool,
     closing: bool,
 }
 
@@ -99,13 +115,15 @@ pub(crate) struct WriterState {
 }
 
 impl Connection {
-    pub(crate) fn new<S>(stream: S, limits: Limits, is_client: bool) -> Self
+    pub(crate) fn new<S>(stream: S, limits: Limits, is_client: bool) -> Result<Self>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
+        limits.validate()?;
         let stream: BoxIo = Box::new(stream);
         let local_parity = if is_client { 0 } else { 1 };
         let next_local_stream_id = AtomicU64::new(local_parity);
+        let next_remote_stream_id = AtomicU64::new(1 - local_parity);
 
         let (incoming_stream_tx, incoming_stream_rx) = mpsc::channel(limits.max_open_streams);
 
@@ -113,11 +131,14 @@ impl Connection {
             limits: limits.clone(),
             local_parity,
             next_local_stream_id,
+            next_remote_stream_id,
+            open_lock: Mutex::new(()),
             streams: Mutex::new(HashMap::new()),
             incoming_stream_tx,
             incoming_stream_rx: Mutex::new(incoming_stream_rx),
             writer: Arc::new(WriterState::new()),
             closed: AtomicBool::new(false),
+            terminated: AtomicBool::new(false),
             close_notify: Notify::new(),
             open_streams: Arc::new(Semaphore::new(limits.max_open_streams)),
             inbound_conn_bytes: Arc::new(Semaphore::new(limits.max_inbound_connection_bytes)),
@@ -127,16 +148,19 @@ impl Connection {
             stats_frames_received: AtomicU64::new(0),
             stats_bytes_sent: AtomicU64::new(0),
             stats_bytes_received: AtomicU64::new(0),
+            connection_handles: AtomicUsize::new(1),
         });
 
         spawn_connection_tasks(stream, shared.clone(), limits.max_frame_size);
 
-        Self { shared }
+        Ok(Self { shared })
     }
 
     /// Opens a new bidirectional stream initiated by the local endpoint.
     #[instrument(skip(self), level = "debug")]
     pub async fn open_bi(&self) -> Result<(SendStream, RecvStream)> {
+        self.shared.ensure_open()?;
+        let _open_guard = self.shared.open_lock.lock().await;
         self.shared.ensure_open()?;
 
         let permit = self
@@ -150,7 +174,10 @@ impl Connection {
         let stream_id = self
             .shared
             .next_local_stream_id
-            .fetch_add(2, Ordering::Relaxed);
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |id| {
+                id.checked_add(2).filter(|next| *next <= VarInt::MAX)
+            })
+            .map_err(|_| Error::StreamIdExhausted)?;
 
         let state = Arc::new(StreamState::new(
             self.shared.limits.max_inbound_stream_bytes,
@@ -163,6 +190,18 @@ impl Connection {
             .lock()
             .await
             .insert(stream_id, state.clone());
+        let announced = self
+            .shared
+            .writer
+            .enqueue_control(Frame::OpenStream {
+                stream_id: VarInt::from_u64(stream_id)
+                    .map_err(|e| Error::Protocol(e.to_string()))?,
+            })
+            .await;
+        if !announced {
+            self.shared.streams.lock().await.remove(&stream_id);
+            return Err(Error::ConnectionClosed);
+        }
         self.shared
             .stats_opened_streams
             .fetch_add(1, Ordering::Relaxed);
@@ -176,10 +215,13 @@ impl Connection {
 
     /// Accepts the next peer-initiated bidirectional stream.
     pub async fn accept_bi(&self) -> Result<(SendStream, RecvStream)> {
-        self.shared.ensure_open()?;
-
         let mut rx = self.shared.incoming_stream_rx.lock().await;
-        let stream_id = rx.recv().await.ok_or(Error::ConnectionClosed)?;
+        let closed = self.shared.close_notify.notified();
+        self.shared.ensure_open()?;
+        let stream_id = tokio::select! {
+            stream_id = rx.recv() => stream_id.ok_or(Error::ConnectionClosed)?,
+            () = closed => return Err(Error::ConnectionClosed),
+        };
         drop(rx);
 
         let state = {
@@ -198,7 +240,25 @@ impl Connection {
 
     /// Sends a connection close frame and shuts down the connection.
     pub async fn close(&self, reason: impl Into<String>) -> Result<()> {
-        self.shared.initiate_close(0, reason.into()).await
+        let reason = reason.into();
+        self.shared.validate_close_reason(0, &reason)?;
+        self.shared.initiate_close(0, reason).await
+    }
+
+    /// Waits until connection tasks have observed terminal shutdown.
+    pub async fn wait_closed(&self) {
+        loop {
+            let notified = self.shared.close_notify.notified();
+            if self.shared.terminated.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Returns whether new connection and stream operations are rejected.
+    pub fn is_closed(&self) -> bool {
+        self.shared.closed.load(Ordering::Acquire)
     }
 
     /// Returns runtime counters.
@@ -209,6 +269,39 @@ impl Connection {
             frames_received: self.shared.stats_frames_received.load(Ordering::Relaxed),
             bytes_sent: self.shared.stats_bytes_sent.load(Ordering::Relaxed),
             bytes_received: self.shared.stats_bytes_received.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl Clone for Connection {
+    fn clone(&self) -> Self {
+        self.shared
+            .connection_handles
+            .fetch_add(1, Ordering::Relaxed);
+        Self {
+            shared: self.shared.clone(),
+        }
+    }
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        if self
+            .shared
+            .connection_handles
+            .fetch_sub(1, Ordering::AcqRel)
+            != 1
+        {
+            return;
+        }
+
+        let shared = self.shared.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let _ = shared
+                    .initiate_close(0, "last connection handle dropped".to_owned())
+                    .await;
+            });
         }
     }
 }
@@ -230,19 +323,28 @@ impl ConnectionShared {
         fin: bool,
     ) -> Result<()> {
         self.ensure_open()?;
-
-        if payload.len() > self.limits.max_frame_size {
-            return Err(Error::LimitExceeded(format!(
-                "payload size {} exceeds max frame size {}",
-                payload.len(),
-                self.limits.max_frame_size
-            )));
-        }
+        let _send_guard = state.send_lock.lock().await;
+        self.ensure_open()?;
 
         if state.send_terminal.load(Ordering::Acquire) {
             return Err(Error::Protocol(
                 "stream send side already closed".to_owned(),
             ));
+        }
+
+        let proto_stream_id =
+            VarInt::from_u64(stream_id).map_err(|e| Error::Protocol(e.to_string()))?;
+        let encoded_len = Frame::Stream {
+            stream_id: proto_stream_id,
+            fin,
+            payload: payload.clone(),
+        }
+        .encoded_len()?;
+        if encoded_len > self.limits.max_frame_size {
+            return Err(Error::LimitExceeded(format!(
+                "encoded stream frame size {encoded_len} exceeds max frame size {}",
+                self.limits.max_frame_size
+            )));
         }
 
         let payload_len = payload.len();
@@ -272,12 +374,13 @@ impl ConnectionShared {
             )
         };
 
-        self.writer
+        self.ensure_open()?;
+        let enqueued = self
+            .writer
             .enqueue_data(
                 stream_id,
                 OutboundChunk {
-                    stream_id: VarInt::from_u64(stream_id)
-                        .map_err(|e| Error::Protocol(e.to_string()))?,
+                    stream_id: proto_stream_id,
                     payload,
                     fin,
                     _conn_permit: conn_permit,
@@ -285,6 +388,9 @@ impl ConnectionShared {
                 },
             )
             .await;
+        if !enqueued {
+            return Err(Error::ConnectionClosed);
+        }
 
         if fin {
             state.send_terminal.store(true, Ordering::Release);
@@ -301,17 +407,25 @@ impl ConnectionShared {
         error_code: u64,
     ) -> Result<()> {
         self.ensure_open()?;
+        let _send_guard = state.send_lock.lock().await;
+        self.ensure_open()?;
+        let proto_stream_id =
+            VarInt::from_u64(stream_id).map_err(|e| Error::Protocol(e.to_string()))?;
+        let error_code = ProtoErrorCode::from_u64(error_code)?;
         if state.send_terminal.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
 
-        self.writer
+        let enqueued = self
+            .writer
             .enqueue_control(Frame::ResetStream {
-                stream_id: VarInt::from_u64(stream_id)
-                    .map_err(|e| Error::Protocol(e.to_string()))?,
-                error_code: ProtoErrorCode::from_u64(error_code)?,
+                stream_id: proto_stream_id,
+                error_code,
             })
             .await;
+        if !enqueued {
+            return Err(Error::ConnectionClosed);
+        }
         self.try_retire_stream(stream_id).await;
         Ok(())
     }
@@ -321,12 +435,14 @@ impl ConnectionShared {
         stream_id: u64,
         state: &Arc<StreamState>,
     ) {
+        let _send_guard = state.send_lock.lock().await;
         if !state.send_terminal.swap(true, Ordering::AcqRel)
             && !self.closed.load(Ordering::Acquire)
             && let (Ok(stream_id), Ok(error_code)) =
                 (VarInt::from_u64(stream_id), ProtoErrorCode::from_u64(0))
         {
-            self.writer
+            let _ = self
+                .writer
                 .enqueue_control(Frame::ResetStream {
                     stream_id,
                     error_code,
@@ -343,7 +459,6 @@ impl ConnectionShared {
         state: &Arc<StreamState>,
     ) {
         state.discard_inbound().await;
-        state.mark_recv_terminal().await;
         self.try_retire_stream(stream_id).await;
     }
 
@@ -352,6 +467,7 @@ impl ConnectionShared {
         error_code: u64,
         reason: String,
     ) -> Result<()> {
+        let reason = self.fit_close_reason(error_code, reason)?;
         if self.closed.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
@@ -363,8 +479,60 @@ impl ConnectionShared {
                 reason,
             })
             .await;
-        self.close_notify.notify_waiters();
         Ok(())
+    }
+
+    fn validate_close_reason(&self, error_code: u64, reason: &str) -> Result<()> {
+        let error_code = ProtoErrorCode::from_u64(error_code)?;
+        let reason_len = u64::try_from(reason.len())
+            .ok()
+            .and_then(|len| VarInt::from_u64(len).ok())
+            .ok_or_else(|| Error::LimitExceeded("close reason is too large".to_owned()))?;
+        let encoded_len = 1 + error_code.encoded_len() + reason_len.encoded_len() + reason.len();
+        if encoded_len > self.limits.max_frame_size {
+            return Err(Error::LimitExceeded(format!(
+                "encoded close frame size {encoded_len} exceeds max frame size {}",
+                self.limits.max_frame_size
+            )));
+        }
+        Ok(())
+    }
+
+    fn fit_close_reason(&self, error_code: u64, reason: String) -> Result<String> {
+        if self.validate_close_reason(error_code, &reason).is_ok() {
+            return Ok(reason);
+        }
+
+        let fallback = "connection error".to_owned();
+        if self.validate_close_reason(error_code, &fallback).is_ok() {
+            Ok(fallback)
+        } else {
+            self.validate_close_reason(error_code, "")?;
+            Ok(String::new())
+        }
+    }
+
+    pub(crate) fn max_stream_payload(&self, stream_id: u64) -> usize {
+        let mut low = 0usize;
+        let mut high = self.limits.max_frame_size.min(u32::MAX as usize);
+        while low < high {
+            let middle = low + (high - low).div_ceil(2);
+            let fits = VarInt::from_u64(stream_id)
+                .ok()
+                .and_then(|stream_id| {
+                    let payload_len = u64::try_from(middle)
+                        .ok()
+                        .and_then(|len| VarInt::from_u64(len).ok())?;
+                    Some(1 + stream_id.encoded_len() + 1 + payload_len.encoded_len() + middle)
+                })
+                .is_some_and(|len| len <= self.limits.max_frame_size);
+            if fits {
+                low = middle;
+            } else {
+                high = middle - 1;
+            }
+        }
+        low
     }
 
     async fn on_remote_stream_frame(
@@ -373,7 +541,13 @@ impl ConnectionShared {
         payload: Bytes,
         fin: bool,
     ) -> Result<()> {
-        let state = self.get_or_create_remote_stream(stream_id).await?;
+        let state = self
+            .streams
+            .lock()
+            .await
+            .get(&stream_id)
+            .cloned()
+            .ok_or_else(|| Error::Protocol(format!("data for unknown stream id {stream_id}")))?;
 
         if !payload.is_empty() {
             state.push_inbound(self, payload).await?;
@@ -388,11 +562,13 @@ impl ConnectionShared {
     }
 
     async fn on_remote_reset(self: &Arc<Self>, stream_id: u64, error_code: u64) -> Result<()> {
-        let state = {
-            let streams = self.streams.lock().await;
-            streams.get(&stream_id).cloned()
-        }
-        .ok_or_else(|| Error::Protocol(format!("reset for unknown stream id {stream_id}")))?;
+        let state = self
+            .streams
+            .lock()
+            .await
+            .get(&stream_id)
+            .cloned()
+            .ok_or_else(|| Error::Protocol(format!("reset for unknown stream id {stream_id}")))?;
 
         state.mark_reset(error_code).await;
         state.mark_recv_terminal().await;
@@ -400,18 +576,22 @@ impl ConnectionShared {
         Ok(())
     }
 
-    async fn get_or_create_remote_stream(
-        self: &Arc<Self>,
-        stream_id: u64,
-    ) -> Result<Arc<StreamState>> {
-        if let Some(state) = self.streams.lock().await.get(&stream_id).cloned() {
-            return Ok(state);
-        }
-
+    async fn on_remote_open(self: &Arc<Self>, stream_id: u64) -> Result<()> {
         if stream_id % 2 == self.local_parity {
             return Err(Error::Protocol(format!(
                 "peer opened stream with invalid parity: {stream_id}"
             )));
+        }
+
+        let next_expected = self.next_remote_stream_id.load(Ordering::Acquire);
+        if stream_id != next_expected {
+            return Err(Error::Protocol(format!(
+                "expected peer stream id {next_expected}, received {stream_id}"
+            )));
+        }
+        let next = stream_id.checked_add(2).ok_or(Error::StreamIdExhausted)?;
+        if next > VarInt::MAX {
+            return Err(Error::StreamIdExhausted);
         }
 
         let permit = self
@@ -428,8 +608,14 @@ impl ConnectionShared {
 
         {
             let mut streams = self.streams.lock().await;
+            if streams.contains_key(&stream_id) {
+                return Err(Error::Protocol(format!(
+                    "peer reused active stream id {stream_id}"
+                )));
+            }
             streams.insert(stream_id, state.clone());
         }
+        self.next_remote_stream_id.store(next, Ordering::Release);
 
         self.stats_opened_streams.fetch_add(1, Ordering::Relaxed);
 
@@ -438,7 +624,7 @@ impl ConnectionShared {
         }
 
         debug!(stream_id, "accepted remote stream");
-        Ok(state)
+        Ok(())
     }
 
     async fn try_retire_stream(&self, stream_id: u64) {
@@ -470,15 +656,22 @@ impl ConnectionShared {
     }
 
     async fn mark_closed(&self) {
-        if self.closed.swap(true, Ordering::AcqRel) {
+        self.closed.store(true, Ordering::Release);
+        if self.terminated.swap(true, Ordering::AcqRel) {
             return;
         }
+        self.open_streams.close();
+        self.inbound_conn_bytes.close();
+        self.outbound_conn_bytes.close();
+        self.writer.shutdown().await;
         self.close_notify.notify_waiters();
-        let mut streams = self.streams.lock().await;
-        for (_, stream) in streams.iter() {
+        let streams = {
+            let mut streams = self.streams.lock().await;
+            std::mem::take(&mut *streams)
+        };
+        for (_, stream) in streams {
             stream.mark_connection_closed().await;
         }
-        streams.clear();
     }
 
     fn record_sent(&self, payload_len: usize) {
@@ -501,14 +694,19 @@ impl WriterState {
                 by_stream: HashMap::new(),
                 ready: VecDeque::new(),
                 control: VecDeque::new(),
+                close_frame: None,
+                graceful_close: false,
                 closing: false,
             }),
             notify: Notify::new(),
         }
     }
 
-    async fn enqueue_data(&self, stream_id: u64, chunk: OutboundChunk) {
+    async fn enqueue_data(&self, stream_id: u64, chunk: OutboundChunk) -> bool {
         let mut queues = self.queues.lock().await;
+        if queues.closing {
+            return false;
+        }
         let q = queues.by_stream.entry(stream_id).or_default();
         let was_empty = q.is_empty();
         q.push_back(chunk);
@@ -517,18 +715,47 @@ impl WriterState {
         }
         drop(queues);
         self.notify.notify_one();
+        true
     }
 
-    async fn enqueue_control(&self, frame: Frame) {
+    async fn enqueue_control(&self, frame: Frame) -> bool {
         let mut queues = self.queues.lock().await;
+        if queues.closing {
+            return false;
+        }
         queues.control.push_back(frame);
         drop(queues);
         self.notify.notify_one();
+        true
     }
 
     async fn enqueue_close(&self, frame: Frame) {
         let mut queues = self.queues.lock().await;
-        queues.control.push_back(frame);
+        let graceful = matches!(
+            &frame,
+            Frame::ConnectionClose {
+                error_code,
+                ..
+            } if error_code.into_inner() == 0
+        );
+        if !graceful {
+            queues.by_stream.clear();
+            queues.ready.clear();
+            queues.control.clear();
+        }
+        queues.close_frame = Some(frame);
+        queues.graceful_close = graceful;
+        queues.closing = true;
+        drop(queues);
+        self.notify.notify_waiters();
+    }
+
+    async fn shutdown(&self) {
+        let mut queues = self.queues.lock().await;
+        queues.by_stream.clear();
+        queues.ready.clear();
+        queues.control.clear();
+        queues.graceful_close = false;
         queues.closing = true;
         drop(queues);
         self.notify.notify_waiters();
@@ -538,6 +765,13 @@ impl WriterState {
         loop {
             let notified = self.notify.notified();
             let mut queues = self.queues.lock().await;
+
+            if queues.closing
+                && !queues.graceful_close
+                && let Some(frame) = queues.close_frame.take()
+            {
+                return Some(frame);
+            }
 
             if let Some(frame) = queues.control.pop_front() {
                 return Some(frame);
@@ -562,6 +796,9 @@ impl WriterState {
             }
 
             if queues.closing {
+                if let Some(frame) = queues.close_frame.take() {
+                    return Some(frame);
+                }
                 return None;
             }
 
@@ -582,12 +819,15 @@ impl StreamState {
                 chunks: VecDeque::new(),
                 reset_error: None,
                 fin_received: false,
+                connection_closed: false,
             }),
             inbound_notify: Notify::new(),
             inbound_stream_bytes: Arc::new(Semaphore::new(max_inbound_stream_bytes)),
             outbound_stream_bytes: Arc::new(Semaphore::new(max_outbound_stream_bytes)),
+            send_lock: Mutex::new(()),
             send_terminal: AtomicBool::new(false),
             recv_terminal: AtomicBool::new(false),
+            recv_discarded: AtomicBool::new(false),
             send_handles: AtomicUsize::new(0),
             recv_handles: AtomicUsize::new(0),
             open_permit: Mutex::new(Some(permit)),
@@ -633,6 +873,9 @@ impl StreamState {
         shared: &Arc<ConnectionShared>,
         payload: Bytes,
     ) -> Result<()> {
+        if self.recv_discarded.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let payload_len = payload.len();
 
         let conn_permit = if payload_len == 0 {
@@ -642,9 +885,12 @@ impl StreamState {
                 shared
                     .inbound_conn_bytes
                     .clone()
-                    .acquire_many_owned(payload_len as u32)
-                    .await
-                    .map_err(|_| Error::ConnectionClosed)?,
+                    .try_acquire_many_owned(payload_len as u32)
+                    .map_err(|_| {
+                        Error::LimitExceeded(
+                            "maximum buffered inbound connection bytes reached".to_owned(),
+                        )
+                    })?,
             )
         };
 
@@ -654,13 +900,19 @@ impl StreamState {
             Some(
                 self.inbound_stream_bytes
                     .clone()
-                    .acquire_many_owned(payload_len as u32)
-                    .await
-                    .map_err(|_| Error::ConnectionClosed)?,
+                    .try_acquire_many_owned(payload_len as u32)
+                    .map_err(|_| {
+                        Error::LimitExceeded(
+                            "maximum buffered inbound stream bytes reached".to_owned(),
+                        )
+                    })?,
             )
         };
 
         let mut inbound = self.inbound.lock().await;
+        if self.recv_discarded.load(Ordering::Acquire) {
+            return Ok(());
+        }
         if inbound.fin_received {
             return Err(Error::Protocol("received stream data after FIN".to_owned()));
         }
@@ -679,6 +931,7 @@ impl StreamState {
     async fn mark_reset(&self, error_code: u64) {
         let mut inbound = self.inbound.lock().await;
         inbound.reset_error = Some(error_code);
+        inbound.chunks.clear();
         drop(inbound);
         self.inbound_notify.notify_waiters();
     }
@@ -693,10 +946,11 @@ impl StreamState {
 
     async fn mark_connection_closed(&self) {
         let mut inbound = self.inbound.lock().await;
-        if inbound.reset_error.is_none() {
-            inbound.reset_error = Some(0);
-        }
+        inbound.connection_closed = true;
+        inbound.chunks.clear();
         drop(inbound);
+        self.inbound_stream_bytes.close();
+        self.outbound_stream_bytes.close();
         self.inbound_notify.notify_waiters();
     }
 
@@ -706,11 +960,10 @@ impl StreamState {
     }
 
     async fn discard_inbound(&self) {
+        self.recv_discarded.store(true, Ordering::Release);
         let mut inbound = self.inbound.lock().await;
         inbound.chunks.clear();
-        inbound.fin_received = true;
         drop(inbound);
-        self.inbound_notify.notify_waiters();
     }
 
     pub(crate) async fn read_chunk(&self) -> Result<Option<Bytes>> {
@@ -720,6 +973,10 @@ impl StreamState {
 
             if let Some(error_code) = inbound.reset_error {
                 return Err(Error::StreamReset(error_code));
+            }
+
+            if inbound.connection_closed {
+                return Err(Error::ConnectionClosed);
             }
 
             if let Some(chunk) = inbound.chunks.pop_front() {
@@ -753,12 +1010,16 @@ fn spawn_connection_tasks(stream: BoxIo, shared: Arc<ConnectionShared>, max_fram
             match item {
                 Ok(bytes) => {
                     reader_shared.record_received(bytes.len());
-                    if let Err(error) = handle_incoming_frame(reader_shared.clone(), bytes).await {
-                        warn!(%error, "reader task failed while handling frame");
-                        let _ = reader_shared
-                            .initiate_close(1, format!("protocol/runtime error: {error}"))
-                            .await;
-                        break;
+                    match handle_incoming_frame(reader_shared.clone(), bytes).await {
+                        Ok(true) => {}
+                        Ok(false) => break,
+                        Err(error) => {
+                            warn!(%error, "reader task failed while handling frame");
+                            let _ = reader_shared
+                                .initiate_close(1, format!("protocol/runtime error: {error}"))
+                                .await;
+                            break;
+                        }
                     }
                 }
                 Err(error) => {
@@ -779,11 +1040,12 @@ fn spawn_connection_tasks(stream: BoxIo, shared: Arc<ConnectionShared>, max_fram
             let mut encoded = BytesMut::new();
             match frame.encode(&mut encoded) {
                 Ok(()) => {
-                    writer_shared.record_sent(encoded.len());
+                    let encoded_len = encoded.len();
                     if let Err(error) = sink.send(encoded.freeze()).await {
                         warn!(%error, "writer send failure");
                         break;
                     }
+                    writer_shared.record_sent(encoded_len);
 
                     if let Frame::ConnectionClose { .. } = frame {
                         break;
@@ -805,7 +1067,7 @@ fn spawn_connection_tasks(stream: BoxIo, shared: Arc<ConnectionShared>, max_fram
     });
 }
 
-async fn handle_incoming_frame(shared: Arc<ConnectionShared>, bytes: BytesMut) -> Result<()> {
+async fn handle_incoming_frame(shared: Arc<ConnectionShared>, bytes: BytesMut) -> Result<bool> {
     let mut bytes = bytes.freeze();
     let frame = Frame::decode(&mut bytes)?;
 
@@ -827,14 +1089,18 @@ async fn handle_incoming_frame(shared: Arc<ConnectionShared>, bytes: BytesMut) -
                 .on_remote_reset(stream_id.into_inner(), error_code.into_inner())
                 .await?;
         }
+        Frame::OpenStream { stream_id } => {
+            shared.on_remote_open(stream_id.into_inner()).await?;
+        }
         Frame::Ping => {
             debug!("received ping");
         }
         Frame::ConnectionClose { error_code, reason } => {
             info!(error_code = error_code.into_inner(), reason = %reason, "received remote close");
             shared.mark_closed().await;
+            return Ok(false);
         }
     }
 
-    Ok(())
+    Ok(true)
 }
