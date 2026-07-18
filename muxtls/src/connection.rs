@@ -1,6 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use futures_util::{SinkExt, StreamExt};
@@ -115,7 +116,13 @@ pub(crate) struct WriterState {
 }
 
 impl Connection {
-    pub(crate) fn new<S>(stream: S, limits: Limits, is_client: bool) -> Result<Self>
+    pub(crate) fn new<S>(
+        stream: S,
+        limits: Limits,
+        is_client: bool,
+        keepalive_interval: Option<Duration>,
+        idle_timeout: Option<Duration>,
+    ) -> Result<Self>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
@@ -151,7 +158,13 @@ impl Connection {
             connection_handles: AtomicUsize::new(1),
         });
 
-        spawn_connection_tasks(stream, shared.clone(), limits.max_frame_size);
+        spawn_connection_tasks(
+            stream,
+            shared.clone(),
+            limits.max_frame_size,
+            keepalive_interval,
+            idle_timeout,
+        );
 
         Ok(Self { shared })
     }
@@ -995,7 +1008,13 @@ impl StreamState {
     }
 }
 
-fn spawn_connection_tasks(stream: BoxIo, shared: Arc<ConnectionShared>, max_frame_size: usize) {
+fn spawn_connection_tasks(
+    stream: BoxIo,
+    shared: Arc<ConnectionShared>,
+    max_frame_size: usize,
+    keepalive_interval: Option<Duration>,
+    idle_timeout: Option<Duration>,
+) {
     let mut codec = LengthDelimitedCodec::builder();
     codec.max_frame_length(max_frame_size);
     codec.length_field_type::<u32>();
@@ -1006,7 +1025,24 @@ fn spawn_connection_tasks(stream: BoxIo, shared: Arc<ConnectionShared>, max_fram
     let reader_shared = shared.clone();
     tokio::spawn(async move {
         info!("reader task started");
-        while let Some(item) = source.next().await {
+        loop {
+            let item = match idle_timeout {
+                Some(timeout) => match tokio::time::timeout(timeout, source.next()).await {
+                    Ok(item) => item,
+                    Err(_) => {
+                        warn!(?timeout, "connection idle timeout elapsed");
+                        let _ = reader_shared
+                            .initiate_close(1, "connection idle timeout elapsed".to_owned())
+                            .await;
+                        break;
+                    }
+                },
+                None => source.next().await,
+            };
+            let Some(item) = item else {
+                break;
+            };
+
             match item {
                 Ok(bytes) => {
                     reader_shared.record_received(bytes.len());
@@ -1032,6 +1068,31 @@ fn spawn_connection_tasks(stream: BoxIo, shared: Arc<ConnectionShared>, max_fram
         reader_shared.mark_closed().await;
         info!("reader task exited");
     });
+
+    if let Some(interval) = keepalive_interval {
+        let keepalive_shared = shared.clone();
+        tokio::spawn(async move {
+            let start = tokio::time::Instant::now() + interval;
+            let mut ticker = tokio::time::interval_at(start, interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+            loop {
+                let closed = keepalive_shared.close_notify.notified();
+                if keepalive_shared.closed.load(Ordering::Acquire) {
+                    break;
+                }
+
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        if !keepalive_shared.writer.enqueue_control(Frame::Ping).await {
+                            break;
+                        }
+                    }
+                    () = closed => break,
+                }
+            }
+        });
+    }
 
     let writer_shared = shared.clone();
     tokio::spawn(async move {

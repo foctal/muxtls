@@ -31,6 +31,8 @@ pub struct Endpoint {
     inner: EndpointInner,
     limits: Limits,
     handshake_timeout: Duration,
+    keepalive_interval: Option<Duration>,
+    idle_timeout: Option<Duration>,
 }
 
 enum EndpointInner {
@@ -52,6 +54,8 @@ impl Endpoint {
             inner: EndpointInner::Client { config },
             limits: Limits::default(),
             handshake_timeout: Self::DEFAULT_HANDSHAKE_TIMEOUT,
+            keepalive_interval: None,
+            idle_timeout: None,
         }
     }
 
@@ -62,6 +66,8 @@ impl Endpoint {
             inner: EndpointInner::Server { listener, config },
             limits: Limits::default(),
             handshake_timeout: Self::DEFAULT_HANDSHAKE_TIMEOUT,
+            keepalive_interval: None,
+            idle_timeout: None,
         })
     }
 
@@ -77,6 +83,25 @@ impl Endpoint {
     /// servers it bounds the TLS handshake after TCP accept.
     pub fn with_handshake_timeout(mut self, timeout: Duration) -> Self {
         self.handshake_timeout = timeout;
+        self
+    }
+
+    /// Sends a `PING` frame at the configured interval on new connections.
+    ///
+    /// Keepalive is disabled by default. Any received frame, including `PING`,
+    /// counts as activity for [`Endpoint::with_idle_timeout`].
+    pub fn with_keepalive_interval(mut self, interval: Duration) -> Self {
+        self.keepalive_interval = Some(interval);
+        self
+    }
+
+    /// Closes new connections when no frame is received for this duration.
+    ///
+    /// The idle timeout is disabled by default. When keepalive is enabled on
+    /// both peers, this duration should be comfortably longer than the
+    /// keepalive interval.
+    pub fn with_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.idle_timeout = Some(timeout);
         self
     }
 
@@ -102,7 +127,10 @@ impl Endpoint {
         let cfg = config.clone();
         let limits = self.limits.clone();
         limits.validate()?;
+        self.validate_connection_policy()?;
         let handshake_timeout = self.handshake_timeout;
+        let keepalive_interval = self.keepalive_interval;
+        let idle_timeout = self.idle_timeout;
         let server_name = server_name.to_owned();
         let fut = async move {
             let tls = tokio::time::timeout(handshake_timeout, async {
@@ -124,7 +152,7 @@ impl Endpoint {
             }
 
             info!(remote = %addr, "client connection established");
-            Connection::new(tls, limits, true)
+            Connection::new(tls, limits, true, keepalive_interval, idle_timeout)
         };
 
         Ok(Connecting {
@@ -145,6 +173,7 @@ impl Endpoint {
         };
 
         self.limits.validate()?;
+        self.validate_connection_policy()?;
         let (tcp, peer) = listener.accept().await?;
         tcp.set_nodelay(true)?;
 
@@ -160,6 +189,26 @@ impl Endpoint {
         }
 
         debug!(remote = %peer, "server accepted connection");
-        Connection::new(tls, self.limits.clone(), false)
+        Connection::new(
+            tls,
+            self.limits.clone(),
+            false,
+            self.keepalive_interval,
+            self.idle_timeout,
+        )
+    }
+
+    fn validate_connection_policy(&self) -> Result<()> {
+        if self.keepalive_interval == Some(Duration::ZERO) {
+            return Err(Error::Config(
+                "keepalive interval must be greater than zero".to_owned(),
+            ));
+        }
+        if self.idle_timeout == Some(Duration::ZERO) {
+            return Err(Error::Config(
+                "idle timeout must be greater than zero".to_owned(),
+            ));
+        }
+        Ok(())
     }
 }

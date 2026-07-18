@@ -387,3 +387,96 @@ async fn inbound_buffer_violation_closes_instead_of_blocking_reader() {
         .expect("client did not observe protocol close");
     server_task.await.expect("server task");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn keepalive_frames_prevent_idle_timeout() {
+    let (server_cfg, cert) = ServerConfig::self_signed_for_localhost().expect("self-signed cert");
+    let keepalive = Duration::from_millis(20);
+    let idle_timeout = Duration::from_millis(100);
+    let server = Endpoint::server("127.0.0.1:0", server_cfg)
+        .await
+        .expect("bind server")
+        .with_keepalive_interval(keepalive)
+        .with_idle_timeout(idle_timeout);
+    let addr = server.local_addr().expect("server address");
+    let server_task = tokio::spawn(async move {
+        let conn = server.accept().await.expect("accept");
+        tokio::time::sleep(Duration::from_millis(180)).await;
+        assert!(!conn.is_closed());
+        assert!(conn.stats().frames_received > 0);
+        conn.wait_closed().await;
+    });
+
+    let client =
+        Endpoint::client(ClientConfig::with_custom_roots(vec![cert]).expect("client config"))
+            .with_keepalive_interval(keepalive)
+            .with_idle_timeout(idle_timeout);
+    let conn = client
+        .connect(addr, "localhost")
+        .expect("start connect")
+        .await
+        .expect("connect");
+
+    tokio::time::sleep(Duration::from_millis(180)).await;
+    assert!(!conn.is_closed());
+    let stats = conn.stats();
+    assert!(stats.frames_sent > 0);
+    assert!(stats.frames_received > 0);
+
+    conn.close("done").await.expect("close");
+    timeout(Duration::from_secs(2), server_task)
+        .await
+        .expect("server timeout")
+        .expect("server task");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn idle_timeout_closes_a_silent_connection() {
+    let (server_cfg, cert) = ServerConfig::self_signed_for_localhost().expect("self-signed cert");
+    let server = Endpoint::server("127.0.0.1:0", server_cfg)
+        .await
+        .expect("bind server")
+        .with_idle_timeout(Duration::from_millis(50));
+    let addr = server.local_addr().expect("server address");
+    let server_task = tokio::spawn(async move {
+        let conn = server.accept().await.expect("accept");
+        timeout(Duration::from_secs(2), conn.wait_closed())
+            .await
+            .expect("server idle timeout did not fire");
+        assert!(conn.is_closed());
+    });
+
+    let client =
+        Endpoint::client(ClientConfig::with_custom_roots(vec![cert]).expect("client config"));
+    let conn = client
+        .connect(addr, "localhost")
+        .expect("start connect")
+        .await
+        .expect("connect");
+
+    timeout(Duration::from_secs(2), conn.wait_closed())
+        .await
+        .expect("client did not observe idle close");
+    assert!(conn.is_closed());
+    server_task.await.expect("server task");
+}
+
+#[tokio::test]
+async fn zero_connection_policy_durations_are_rejected() {
+    let endpoint = Endpoint::client(ClientConfig::dangerous_insecure_no_verify_for_testing())
+        .with_keepalive_interval(Duration::ZERO);
+    let addr = "127.0.0.1:9".parse().expect("socket address");
+    let error = match endpoint.connect(addr, "localhost") {
+        Ok(_) => panic!("zero keepalive interval must fail"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, muxtls::Error::Config(message) if message.contains("keepalive")));
+
+    let endpoint = Endpoint::client(ClientConfig::dangerous_insecure_no_verify_for_testing())
+        .with_idle_timeout(Duration::ZERO);
+    let error = match endpoint.connect(addr, "localhost") {
+        Ok(_) => panic!("zero idle timeout must fail"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, muxtls::Error::Config(message) if message.contains("idle")));
+}

@@ -42,8 +42,9 @@ the library should be used across an untrusted network boundary.
 - [ ] Add protocol conformance vectors shared with any non-Rust implementation.
 - [ ] Add coverage-guided fuzzing for `VarInt::decode`, `Frame::decode`, and
   connection state transitions.
-- [ ] Add keepalive/idle-timeout policy. `PING` is decoded but is not exposed or
-  scheduled by the public API.
+- [x] Add opt-in keepalive and inbound idle-timeout policies. Endpoints can
+  schedule `PING` frames and close connections that receive no frames within a
+  configured duration.
 
 ## P1 — TLS and deployment
 

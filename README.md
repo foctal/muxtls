@@ -18,6 +18,7 @@ Multiplexed streams over TLS/TCP
 - Protocol isolation through the `muxtls/1` ALPN identifier
 - Multiple independent bidirectional logical streams over one TLS/TCP connection
 - Bounded-memory runtime with per-frame, per-stream, and per-connection limits
+- Optional protocol keepalive and inbound idle timeouts
 - Stream-oriented API with async backpressure
 - `SendStream` implements `tokio::io::AsyncWrite`
 - `RecvStream` implements `tokio::io::AsyncRead`
