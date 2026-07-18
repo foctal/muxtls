@@ -36,10 +36,10 @@ the library should be used across an untrusted network boundary.
 - [ ] Design protocol-level flow control. The current protocol has no
   window-update frame, so a peer that exceeds advertised local buffering
   cannot be backpressured per stream and is disconnected instead.
-- [ ] Expand the wire protocol into a standalone versioned document, including
+- [x] Expand the wire protocol into a standalone versioned document, including
   the four-byte length prefix, stream ID rules, state transitions, error codes,
   and compatibility policy.
-- [ ] Add protocol conformance vectors shared with any non-Rust implementation.
+- [x] Add protocol conformance vectors shared with any non-Rust implementation.
 - [ ] Add coverage-guided fuzzing for `VarInt::decode`, `Frame::decode`, and
   connection state transitions.
 - [x] Add opt-in keepalive and inbound idle-timeout policies. Endpoints can

@@ -554,6 +554,8 @@ name = "muxtls-proto"
 version = "0.2.0"
 dependencies = [
  "bytes",
+ "serde",
+ "serde_json",
  "thiserror 2.0.18",
 ]
 

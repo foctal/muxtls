@@ -47,6 +47,11 @@ API documentation is available on [docs.rs][doc-url].
 `muxtls` uses a four-byte big-endian length prefix followed by a frame encoded
 by `muxtls-proto`. Client-initiated stream IDs are even, server-initiated stream
 IDs are odd, and each side announces IDs monotonically with `OPEN_STREAM`.
+See the
+[`muxtls-proto/PROTOCOL.md`](https://github.com/foctal/muxtls/blob/main/muxtls-proto/PROTOCOL.md)
+document for the complete version 1 specification and the
+[`v1.json`](https://github.com/foctal/muxtls/blob/main/muxtls-proto/test-vectors/v1.json)
+file for language-independent conformance vectors.
 
 Supported frame types:
 - `OPEN_STREAM`
