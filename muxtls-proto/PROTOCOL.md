@@ -183,6 +183,10 @@ Applications should configure compatible limits on both endpoints.
 TCP flow control still applies to the entire connection, but it cannot prevent
 one logical stream from consuming a peer's configured per-stream buffer.
 
+A protocol-level flow-control design is specified separately in
+[`FLOW_CONTROL.md`](FLOW_CONTROL.md). It requires a future `muxtls/2` ALPN
+identifier because version 1 cannot add the necessary frames compatibly.
+
 ## Compatibility policy
 
 Version 1 receivers reject unknown frame types and nonzero reserved flags.
