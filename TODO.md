@@ -33,9 +33,10 @@ the library should be used across an untrusted network boundary.
 - [x] Make `AsyncWrite` accept buffers larger than one frame by reporting a
   valid partial write.
 - [x] Validate close reasons before changing connection state.
-- [ ] Design protocol-level flow control. The current protocol has no
+- [x] Design protocol-level flow control. The current protocol has no
   window-update frame, so a peer that exceeds advertised local buffering
-  cannot be backpressured per stream and is disconnected instead.
+  cannot be backpressured per stream and is disconnected instead. The design
+  is reserved for `muxtls/2` because version 1 cannot add frames compatibly.
 - [x] Expand the wire protocol into a standalone versioned document, including
   the four-byte length prefix, stream ID rules, state transitions, error codes,
   and compatibility policy.
@@ -50,10 +51,11 @@ the library should be used across an untrusted network boundary.
 
 - [x] Report failure when the native certificate store yields no usable roots.
 - [x] Document that server accept loops must run TLS handshakes concurrently.
-- [ ] Add optional mutual TLS configuration and peer identity accessors.
-- [ ] Define certificate rotation and session-resumption behavior.
+- [x] Add optional mutual TLS configuration and peer identity accessors.
+- [x] Define certificate rotation and session-resumption behavior.
 - [ ] Run an independent security review before handling sensitive production
-  traffic.
+  traffic. The scope, evidence, independence, and acceptance requirements are
+  defined in `SECURITY_REVIEW.md`; external review and sign-off are pending.
 
 ## P2 — Quality and operations
 

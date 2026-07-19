@@ -19,6 +19,7 @@ Multiplexed streams over TLS/TCP
 - Multiple independent bidirectional logical streams over one TLS/TCP connection
 - Bounded-memory runtime with per-frame, per-stream, and per-connection limits
 - Optional protocol keepalive and inbound idle timeouts
+- Optional mutual TLS and verified peer certificate access
 - Stream-oriented API with async backpressure
 - `SendStream` implements `tokio::io::AsyncWrite`
 - `RecvStream` implements `tokio::io::AsyncRead`
@@ -67,6 +68,11 @@ Supported frame types:
 The examples generate and bypass verification of a development certificate.
 Use `ServerConfig::from_pem_files` and `ClientConfig::with_native_roots` (or
 explicit custom roots) in deployed services.
+
+For mutual TLS, use the client `*_and_client_auth` constructors and
+`ServerConfig::from_der_with_client_auth`, then inspect the verified certificate
+chain with `Connection::peer_identity`. Certificate rotation, session
+resumption, and identity-mapping guidance is in [`SECURITY.md`](SECURITY.md).
 
 ## Fuzzing
 

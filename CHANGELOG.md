@@ -17,6 +17,10 @@ All notable changes to this project are documented in this file.
   conformance vectors.
 - Coverage-guided fuzz targets for variable-length integers, frames, and
   connection state transitions.
+- Optional mutual TLS configuration and verified peer certificate access.
+- A version 2 protocol-level flow-control design.
+- Certificate rotation, TLS session resumption, and independent review
+  guidance.
 
 ### Changed
 
