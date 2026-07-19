@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use muxtls::{ClientConfig, Endpoint, Limits, ServerConfig};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
 use tracing_subscriber::EnvFilter;
@@ -479,4 +480,97 @@ async fn zero_connection_policy_durations_are_rejected() {
         Err(error) => error,
     };
     assert!(matches!(error, muxtls::Error::Config(message) if message.contains("idle")));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mutual_tls_exposes_verified_peer_certificates() {
+    let server_identity =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_owned(), "127.0.0.1".to_owned()])
+            .expect("server identity");
+    let server_cert = server_identity.cert.der().clone();
+    let server_key =
+        PrivateKeyDer::try_from(server_identity.signing_key.serialize_der()).expect("server key");
+
+    let client_identity = rcgen::generate_simple_self_signed(vec!["client.local".to_owned()])
+        .expect("client identity");
+    let client_cert: CertificateDer<'static> = client_identity.cert.der().clone();
+    let client_key =
+        PrivateKeyDer::try_from(client_identity.signing_key.serialize_der()).expect("client key");
+
+    let server_config = ServerConfig::from_der_with_client_auth(
+        vec![server_cert.clone()],
+        server_key,
+        vec![client_cert.clone()],
+    )
+    .expect("mTLS server config");
+    let server = Endpoint::server("127.0.0.1:0", server_config)
+        .await
+        .expect("bind server");
+    let addr = server.local_addr().expect("server address");
+    let expected_client_cert = client_cert.clone();
+    let server_task = tokio::spawn(async move {
+        let conn = server.accept().await.expect("authenticated client");
+        let identity = conn.peer_identity().expect("client identity");
+        assert_eq!(identity.certificates(), &[expected_client_cert]);
+        conn.wait_closed().await;
+    });
+
+    let client_config = ClientConfig::with_custom_roots_and_client_auth(
+        vec![server_cert],
+        vec![client_cert],
+        client_key,
+    )
+    .expect("mTLS client config");
+    let conn = Endpoint::client(client_config)
+        .connect(addr, "localhost")
+        .expect("start connect")
+        .await
+        .expect("connect");
+    assert!(
+        conn.peer_identity()
+            .is_some_and(|identity| !identity.certificates().is_empty())
+    );
+
+    conn.close("done").await.expect("close");
+    timeout(Duration::from_secs(2), server_task)
+        .await
+        .expect("server timeout")
+        .expect("server task");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mutual_tls_rejects_clients_without_certificates() {
+    let server_identity =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_owned(), "127.0.0.1".to_owned()])
+            .expect("server identity");
+    let server_cert = server_identity.cert.der().clone();
+    let server_key =
+        PrivateKeyDer::try_from(server_identity.signing_key.serialize_der()).expect("server key");
+    let trusted_client = rcgen::generate_simple_self_signed(vec!["client.local".to_owned()])
+        .expect("trusted client identity");
+
+    let server_config = ServerConfig::from_der_with_client_auth(
+        vec![server_cert.clone()],
+        server_key,
+        vec![trusted_client.cert.der().clone()],
+    )
+    .expect("mTLS server config");
+    let server = Endpoint::server("127.0.0.1:0", server_config)
+        .await
+        .expect("bind server");
+    let addr = server.local_addr().expect("server address");
+    let server_task = tokio::spawn(async move { server.accept().await });
+
+    let client_config = ClientConfig::with_custom_roots(vec![server_cert]).expect("client roots");
+    let client_result = Endpoint::client(client_config)
+        .connect(addr, "localhost")
+        .expect("start connect")
+        .await;
+    let server_result = server_task.await.expect("server task");
+
+    assert!(client_result.is_err() || server_result.is_err());
+    assert!(
+        server_result.is_err(),
+        "server must reject anonymous clients"
+    );
 }

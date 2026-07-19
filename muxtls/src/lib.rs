@@ -40,7 +40,7 @@ mod limits;
 mod stream;
 
 pub use config::{ClientConfig, ServerConfig};
-pub use connection::{Connection, ConnectionStats};
+pub use connection::{Connection, ConnectionStats, PeerIdentity};
 pub use endpoint::{Connecting, Endpoint};
 pub use error::{Error, Result};
 pub use limits::Limits;

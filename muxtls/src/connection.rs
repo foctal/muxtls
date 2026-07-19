@@ -6,6 +6,7 @@ use std::time::Duration;
 use bytes::{Bytes, BytesMut};
 use futures_util::{SinkExt, StreamExt};
 use muxtls_proto::{ErrorCode as ProtoErrorCode, Frame, VarInt};
+use rustls::pki_types::CertificateDer;
 use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use tracing::{debug, info, instrument, warn};
@@ -42,6 +43,16 @@ pub struct Connection {
     pub(crate) shared: Arc<ConnectionShared>,
 }
 
+/// The certificate chain associated with the completed TLS handshake.
+///
+/// Whether the chain was cryptographically verified is determined by the TLS
+/// configuration. The testing-only insecure client verifier does not establish
+/// an authenticated identity.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct PeerIdentity {
+    certificates: Vec<CertificateDer<'static>>,
+}
+
 pub(crate) struct ConnectionShared {
     pub(crate) limits: Limits,
     pub(crate) local_parity: u64,
@@ -64,6 +75,7 @@ pub(crate) struct ConnectionShared {
     pub(crate) stats_bytes_sent: AtomicU64,
     pub(crate) stats_bytes_received: AtomicU64,
     pub(crate) connection_handles: AtomicUsize,
+    pub(crate) peer_identity: Option<PeerIdentity>,
 }
 
 pub(crate) struct StreamState {
@@ -120,6 +132,7 @@ impl Connection {
         stream: S,
         limits: Limits,
         is_client: bool,
+        peer_certificates: Option<Vec<CertificateDer<'static>>>,
         keepalive_interval: Option<Duration>,
         idle_timeout: Option<Duration>,
     ) -> Result<Self>
@@ -156,6 +169,7 @@ impl Connection {
             stats_bytes_sent: AtomicU64::new(0),
             stats_bytes_received: AtomicU64::new(0),
             connection_handles: AtomicUsize::new(1),
+            peer_identity: peer_certificates.map(|certificates| PeerIdentity { certificates }),
         });
 
         spawn_connection_tasks(
@@ -277,6 +291,22 @@ impl Connection {
             bytes_sent: self.shared.stats_bytes_sent.load(Ordering::Relaxed),
             bytes_received: self.shared.stats_bytes_received.load(Ordering::Relaxed),
         }
+    }
+
+    /// Returns the peer certificate chain from the completed TLS handshake.
+    ///
+    /// The first certificate is the peer's end-entity certificate. Servers
+    /// configured without client authentication return `None` for clients that
+    /// did not present a certificate.
+    pub fn peer_identity(&self) -> Option<&PeerIdentity> {
+        self.shared.peer_identity.as_ref()
+    }
+}
+
+impl PeerIdentity {
+    /// Returns the peer certificate chain, with the end-entity certificate first.
+    pub fn certificates(&self) -> &[CertificateDer<'static>] {
+        &self.certificates
     }
 }
 
@@ -1041,8 +1071,8 @@ pub fn fuzz_connection_state(is_client: bool, frames: &[Vec<u8>]) {
             max_inbound_stream_bytes: 512,
             max_outbound_stream_bytes: 512,
         };
-        let connection =
-            Connection::new(transport, limits, is_client, None, None).expect("fuzz connection");
+        let connection = Connection::new(transport, limits, is_client, None, None, None)
+            .expect("fuzz connection");
 
         for frame in frames.iter().take(64) {
             let Ok(frame_len) = u32::try_from(frame.len()) else {

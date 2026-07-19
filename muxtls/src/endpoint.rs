@@ -152,7 +152,15 @@ impl Endpoint {
             }
 
             info!(remote = %addr, "client connection established");
-            Connection::new(tls, limits, true, keepalive_interval, idle_timeout)
+            let peer_certificates = tls.get_ref().1.peer_certificates().map(<[_]>::to_vec);
+            Connection::new(
+                tls,
+                limits,
+                true,
+                peer_certificates,
+                keepalive_interval,
+                idle_timeout,
+            )
         };
 
         Ok(Connecting {
@@ -189,10 +197,12 @@ impl Endpoint {
         }
 
         debug!(remote = %peer, "server accepted connection");
+        let peer_certificates = tls.get_ref().1.peer_certificates().map(<[_]>::to_vec);
         Connection::new(
             tls,
             self.limits.clone(),
             false,
+            peer_certificates,
             self.keepalive_interval,
             self.idle_timeout,
         )
