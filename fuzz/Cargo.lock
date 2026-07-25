@@ -293,7 +293,7 @@ dependencies = [
 
 [[package]]
 name = "muxtls"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "bytes",
  "futures-util",
@@ -321,7 +321,7 @@ dependencies = [
 
 [[package]]
 name = "muxtls-proto"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "bytes",
  "thiserror",
