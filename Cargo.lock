@@ -530,12 +530,10 @@ dependencies = [
 
 [[package]]
 name = "muxtls"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "bytes",
  "criterion",
- "futures-core",
- "futures-sink",
  "futures-util",
  "muxtls-proto",
  "rcgen",
@@ -543,7 +541,6 @@ dependencies = [
  "rustls-native-certs",
  "rustls-pemfile",
  "rustls-platform-verifier",
- "socket2",
  "thiserror 2.0.18",
  "tokio",
  "tokio-rustls",
@@ -554,9 +551,11 @@ dependencies = [
 
 [[package]]
 name = "muxtls-proto"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "bytes",
+ "serde",
+ "serde_json",
  "thiserror 2.0.18",
 ]
 

@@ -17,6 +17,9 @@ pub enum ProtoError {
     #[error("unknown frame type: {0:#x}")]
     UnknownFrameType(u8),
 
+    #[error("unsupported flags {flags:#x} for frame type {frame_type:#x}")]
+    UnsupportedFlags { frame_type: u8, flags: u8 },
+
     #[error("invalid UTF-8 in close reason")]
     InvalidUtf8,
 

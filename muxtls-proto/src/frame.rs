@@ -10,35 +10,90 @@ const STREAM_FIN_FLAG: u8 = 0x01;
 pub struct ErrorCode(pub VarInt);
 
 impl ErrorCode {
+    /// Creates an application error code from an integer.
     pub fn from_u64(value: u64) -> Result<Self> {
         Ok(Self(VarInt::from_u64(value)?))
     }
 
+    /// Returns the underlying integer value.
     pub fn into_inner(self) -> u64 {
         self.0.into_inner()
+    }
+
+    /// Returns the number of bytes used by the wire encoding.
+    pub const fn encoded_len(self) -> usize {
+        self.0.encoded_len()
     }
 }
 
 /// One protocol frame.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub enum Frame {
+    /// Carries ordered stream data and an optional send-side FIN.
     Stream {
+        /// Stream identifier.
         stream_id: VarInt,
+        /// Whether this frame closes the peer's send side.
         fin: bool,
+        /// Application payload.
         payload: Bytes,
     },
+    /// Abruptly closes a stream.
     ResetStream {
+        /// Stream identifier.
         stream_id: VarInt,
+        /// Application-defined error code.
         error_code: ErrorCode,
     },
+    /// Announces a newly allocated bidirectional stream.
+    OpenStream {
+        /// Stream identifier.
+        stream_id: VarInt,
+    },
+    /// A liveness probe with no payload.
     Ping,
+    /// Closes the entire connection.
     ConnectionClose {
+        /// Application or protocol error code.
         error_code: ErrorCode,
+        /// Human-readable diagnostic text.
         reason: String,
     },
 }
 
 impl Frame {
+    /// Returns the exact encoded length of this frame.
+    pub fn encoded_len(&self) -> Result<usize> {
+        match self {
+            Self::Stream {
+                stream_id, payload, ..
+            } => {
+                let payload_len = VarInt::from_u64(
+                    payload
+                        .len()
+                        .try_into()
+                        .map_err(|_| ProtoError::LengthOverflow(u64::MAX))?,
+                )?;
+                Ok(1 + stream_id.encoded_len() + 1 + payload_len.encoded_len() + payload.len())
+            }
+            Self::ResetStream {
+                stream_id,
+                error_code,
+            } => Ok(1 + stream_id.encoded_len() + error_code.encoded_len()),
+            Self::OpenStream { stream_id } => Ok(1 + stream_id.encoded_len()),
+            Self::Ping => Ok(1),
+            Self::ConnectionClose { error_code, reason } => {
+                let reason_len = VarInt::from_u64(
+                    reason
+                        .len()
+                        .try_into()
+                        .map_err(|_| ProtoError::LengthOverflow(u64::MAX))?,
+                )?;
+                Ok(1 + error_code.encoded_len() + reason_len.encoded_len() + reason.len())
+            }
+        }
+    }
+
     /// Encodes this frame into a buffer.
     pub fn encode(&self, out: &mut impl BufMut) -> Result<()> {
         match self {
@@ -60,6 +115,10 @@ impl Frame {
                 out.put_u8(0x01);
                 stream_id.encode(out);
                 error_code.0.encode(out);
+            }
+            Frame::OpenStream { stream_id } => {
+                out.put_u8(0x04);
+                stream_id.encode(out);
             }
             Frame::Ping => out.put_u8(0x02),
             Frame::ConnectionClose { error_code, reason } => {
@@ -86,6 +145,9 @@ impl Frame {
                     return Err(ProtoError::UnexpectedEof);
                 }
                 let flags = src.get_u8();
+                if flags & !STREAM_FIN_FLAG != 0 {
+                    return Err(ProtoError::UnsupportedFlags { frame_type, flags });
+                }
                 let data_len = VarInt::decode(src)?.into_inner();
                 let data_len: usize = data_len
                     .try_into()
@@ -126,6 +188,9 @@ impl Frame {
 
                 Frame::ConnectionClose { error_code, reason }
             }
+            0x04 => Frame::OpenStream {
+                stream_id: VarInt::decode(src)?,
+            },
             other => return Err(ProtoError::UnknownFrameType(other)),
         };
 
@@ -186,5 +251,62 @@ mod tests {
             }
             _ => panic!("decoded unexpected frame type"),
         }
+    }
+
+    #[test]
+    fn encoded_len_matches_output() {
+        let frames = [
+            Frame::Ping,
+            Frame::ResetStream {
+                stream_id: VarInt::from_u64(16_384).unwrap(),
+                error_code: ErrorCode::from_u64(64).unwrap(),
+            },
+            Frame::OpenStream {
+                stream_id: VarInt::from_u64(2).unwrap(),
+            },
+            Frame::ConnectionClose {
+                error_code: ErrorCode::from_u64(1).unwrap(),
+                reason: "goodbye".to_owned(),
+            },
+            Frame::Stream {
+                stream_id: VarInt::from_u64(1_073_741_824).unwrap(),
+                fin: false,
+                payload: bytes::Bytes::from_static(b"payload"),
+            },
+        ];
+
+        for frame in frames {
+            let mut encoded = BytesMut::new();
+            frame.encode(&mut encoded).unwrap();
+            assert_eq!(frame.encoded_len().unwrap(), encoded.len());
+        }
+    }
+
+    #[test]
+    fn unsupported_stream_flags_are_rejected() {
+        let mut encoded = bytes::Bytes::from_static(&[0x00, 0x00, 0x02, 0x00]);
+        let error = Frame::decode(&mut encoded).expect_err("reserved flag must fail");
+        assert!(matches!(
+            error,
+            crate::ProtoError::UnsupportedFlags {
+                frame_type: 0,
+                flags: 2
+            }
+        ));
+    }
+
+    #[test]
+    fn trailing_and_truncated_frames_are_rejected() {
+        let mut trailing = bytes::Bytes::from_static(&[0x02, 0xff]);
+        assert!(matches!(
+            Frame::decode(&mut trailing),
+            Err(crate::ProtoError::TrailingBytes { remaining: 1 })
+        ));
+
+        let mut truncated = bytes::Bytes::from_static(&[0x00, 0x00, 0x00, 0x05, 0x01]);
+        assert!(matches!(
+            Frame::decode(&mut truncated),
+            Err(crate::ProtoError::UnexpectedEof)
+        ));
     }
 }

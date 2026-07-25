@@ -2,12 +2,13 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tracing::{debug, info, instrument};
 
-use crate::config::{ClientConfig, ServerConfig};
+use crate::config::{ALPN_PROTOCOL, ClientConfig, ServerConfig};
 use crate::connection::Connection;
 use crate::error::{Error, Result};
 use crate::limits::Limits;
@@ -29,6 +30,9 @@ impl Future for Connecting {
 pub struct Endpoint {
     inner: EndpointInner,
     limits: Limits,
+    handshake_timeout: Duration,
+    keepalive_interval: Option<Duration>,
+    idle_timeout: Option<Duration>,
 }
 
 enum EndpointInner {
@@ -42,11 +46,16 @@ enum EndpointInner {
 }
 
 impl Endpoint {
+    const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
     /// Creates a client endpoint.
     pub fn client(config: ClientConfig) -> Self {
         Self {
             inner: EndpointInner::Client { config },
             limits: Limits::default(),
+            handshake_timeout: Self::DEFAULT_HANDSHAKE_TIMEOUT,
+            keepalive_interval: None,
+            idle_timeout: None,
         }
     }
 
@@ -56,12 +65,43 @@ impl Endpoint {
         Ok(Self {
             inner: EndpointInner::Server { listener, config },
             limits: Limits::default(),
+            handshake_timeout: Self::DEFAULT_HANDSHAKE_TIMEOUT,
+            keepalive_interval: None,
+            idle_timeout: None,
         })
     }
 
     /// Overrides default limits for newly created connections.
     pub fn with_limits(mut self, limits: Limits) -> Self {
         self.limits = limits;
+        self
+    }
+
+    /// Sets the timeout for TCP/TLS connection establishment.
+    ///
+    /// For clients this bounds both TCP connect and the TLS handshake. For
+    /// servers it bounds the TLS handshake after TCP accept.
+    pub fn with_handshake_timeout(mut self, timeout: Duration) -> Self {
+        self.handshake_timeout = timeout;
+        self
+    }
+
+    /// Sends a `PING` frame at the configured interval on new connections.
+    ///
+    /// Keepalive is disabled by default. Any received frame, including `PING`,
+    /// counts as activity for [`Endpoint::with_idle_timeout`].
+    pub fn with_keepalive_interval(mut self, interval: Duration) -> Self {
+        self.keepalive_interval = Some(interval);
+        self
+    }
+
+    /// Closes new connections when no frame is received for this duration.
+    ///
+    /// The idle timeout is disabled by default. When keepalive is enabled on
+    /// both peers, this duration should be comfortably longer than the
+    /// keepalive interval.
+    pub fn with_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.idle_timeout = Some(timeout);
         self
     }
 
@@ -86,19 +126,41 @@ impl Endpoint {
 
         let cfg = config.clone();
         let limits = self.limits.clone();
+        limits.validate()?;
+        self.validate_connection_policy()?;
+        let handshake_timeout = self.handshake_timeout;
+        let keepalive_interval = self.keepalive_interval;
+        let idle_timeout = self.idle_timeout;
         let server_name = server_name.to_owned();
         let fut = async move {
-            let tcp = TcpStream::connect(addr).await?;
-            tcp.set_nodelay(true)?;
+            let tls = tokio::time::timeout(handshake_timeout, async {
+                let tcp = TcpStream::connect(addr).await?;
+                tcp.set_nodelay(true)?;
 
-            let connector = TlsConnector::from(cfg.inner.clone());
-            let tls = connector
-                .connect(ClientConfig::server_name(&server_name)?, tcp)
-                .await
-                .map_err(|e| Error::Config(e.to_string()))?;
+                let connector = TlsConnector::from(cfg.inner.clone());
+                connector
+                    .connect(ClientConfig::server_name(&server_name)?, tcp)
+                    .await
+                    .map_err(|e| Error::TlsHandshake(e.to_string()))
+            })
+            .await
+            .map_err(|_| Error::Timeout("connection establishment"))??;
+            if tls.get_ref().1.alpn_protocol() != Some(ALPN_PROTOCOL) {
+                return Err(Error::TlsHandshake(
+                    "peer did not negotiate the required muxtls/1 ALPN".to_owned(),
+                ));
+            }
 
             info!(remote = %addr, "client connection established");
-            Ok(Connection::new(tls, limits, true))
+            let peer_certificates = tls.get_ref().1.peer_certificates().map(<[_]>::to_vec);
+            Connection::new(
+                tls,
+                limits,
+                true,
+                peer_certificates,
+                keepalive_interval,
+                idle_timeout,
+            )
         };
 
         Ok(Connecting {
@@ -106,7 +168,10 @@ impl Endpoint {
         })
     }
 
-    /// Accepts one incoming connection from a server endpoint.
+    /// Accepts and handshakes one incoming connection.
+    ///
+    /// A production accept loop should run multiple calls concurrently so one
+    /// slow TLS peer cannot delay acceptance of unrelated connections.
     #[instrument(skip(self), level = "info")]
     pub async fn accept(&self) -> Result<Connection> {
         let EndpointInner::Server { listener, config } = &self.inner else {
@@ -115,16 +180,45 @@ impl Endpoint {
             ));
         };
 
+        self.limits.validate()?;
+        self.validate_connection_policy()?;
         let (tcp, peer) = listener.accept().await?;
         tcp.set_nodelay(true)?;
 
         let acceptor = TlsAcceptor::from(config.inner.clone());
-        let tls = acceptor
-            .accept(tcp)
+        let tls = tokio::time::timeout(self.handshake_timeout, acceptor.accept(tcp))
             .await
-            .map_err(|e| Error::Config(e.to_string()))?;
+            .map_err(|_| Error::Timeout("TLS handshake"))?
+            .map_err(|e| Error::TlsHandshake(e.to_string()))?;
+        if tls.get_ref().1.alpn_protocol() != Some(ALPN_PROTOCOL) {
+            return Err(Error::TlsHandshake(
+                "peer did not negotiate the required muxtls/1 ALPN".to_owned(),
+            ));
+        }
 
         debug!(remote = %peer, "server accepted connection");
-        Ok(Connection::new(tls, self.limits.clone(), false))
+        let peer_certificates = tls.get_ref().1.peer_certificates().map(<[_]>::to_vec);
+        Connection::new(
+            tls,
+            self.limits.clone(),
+            false,
+            peer_certificates,
+            self.keepalive_interval,
+            self.idle_timeout,
+        )
+    }
+
+    fn validate_connection_policy(&self) -> Result<()> {
+        if self.keepalive_interval == Some(Duration::ZERO) {
+            return Err(Error::Config(
+                "keepalive interval must be greater than zero".to_owned(),
+            ));
+        }
+        if self.idle_timeout == Some(Duration::ZERO) {
+            return Err(Error::Config(
+                "idle timeout must be greater than zero".to_owned(),
+            ));
+        }
+        Ok(())
     }
 }

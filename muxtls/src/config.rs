@@ -5,11 +5,15 @@ use std::sync::Arc;
 
 use rcgen::generate_simple_self_signed;
 use rustls::DigitallySignedStruct;
+use rustls::RootCertStore;
 use rustls::SignatureScheme;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
+use rustls::server::WebPkiClientVerifier;
 
 use crate::error::{Error, Result};
+
+pub(crate) const ALPN_PROTOCOL: &[u8] = b"muxtls/1";
 
 /// Client-side TLS configuration wrapper.
 #[derive(Clone)]
@@ -26,15 +30,11 @@ pub struct ServerConfig {
 impl ClientConfig {
     /// Builds a client config from native platform root certificates.
     pub fn with_native_roots() -> Result<Self> {
-        let mut roots = rustls::RootCertStore::empty();
-        let cert_result = rustls_native_certs::load_native_certs();
-        for cert in cert_result.certs {
-            roots.add(cert).map_err(|e| Error::Config(e.to_string()))?;
-        }
-
-        let config = rustls::ClientConfig::builder()
+        let roots = native_roots()?;
+        let mut config = rustls::ClientConfig::builder()
             .with_root_certificates(roots)
             .with_no_client_auth();
+        config.alpn_protocols = vec![ALPN_PROTOCOL.to_vec()];
 
         Ok(Self {
             inner: Arc::new(config),
@@ -46,10 +46,36 @@ impl ClientConfig {
     pub fn with_platform_verifier() -> Result<Self> {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let verifier = rustls_platform_verifier::Verifier::new(provider)?;
-        let config = rustls::ClientConfig::builder()
+        let mut config = rustls::ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(verifier))
             .with_no_client_auth();
+        config.alpn_protocols = vec![ALPN_PROTOCOL.to_vec()];
+
+        Ok(Self {
+            inner: Arc::new(config),
+        })
+    }
+
+    /// Builds a client config using platform verification and a client certificate.
+    #[cfg(feature = "platform-verifier")]
+    pub fn with_platform_verifier_and_client_auth(
+        client_certs: Vec<CertificateDer<'static>>,
+        client_key: PrivateKeyDer<'static>,
+    ) -> Result<Self> {
+        if client_certs.is_empty() {
+            return Err(Error::Config(
+                "at least one client certificate is required".to_owned(),
+            ));
+        }
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let verifier = rustls_platform_verifier::Verifier::new(provider)?;
+        let mut config = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(verifier))
+            .with_client_auth_cert(client_certs, client_key)
+            .map_err(|e| Error::Config(e.to_string()))?;
+        config.alpn_protocols = vec![ALPN_PROTOCOL.to_vec()];
 
         Ok(Self {
             inner: Arc::new(config),
@@ -58,10 +84,11 @@ impl ClientConfig {
 
     /// Builds an insecure testing-only client config that skips certificate verification.
     pub fn dangerous_insecure_no_verify_for_testing() -> Self {
-        let config = rustls::ClientConfig::builder()
+        let mut config = rustls::ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(InsecureNoVerify))
             .with_no_client_auth();
+        config.alpn_protocols = vec![ALPN_PROTOCOL.to_vec()];
 
         Self {
             inner: Arc::new(config),
@@ -70,14 +97,56 @@ impl ClientConfig {
 
     /// Creates a client config that trusts one or more custom root certificates.
     pub fn with_custom_roots(certs: Vec<CertificateDer<'static>>) -> Result<Self> {
-        let mut roots = rustls::RootCertStore::empty();
-        for cert in certs {
-            roots.add(cert).map_err(|e| Error::Config(e.to_string()))?;
-        }
-
-        let config = rustls::ClientConfig::builder()
+        let roots = root_store(certs, "custom root")?;
+        let mut config = rustls::ClientConfig::builder()
             .with_root_certificates(roots)
             .with_no_client_auth();
+        config.alpn_protocols = vec![ALPN_PROTOCOL.to_vec()];
+
+        Ok(Self {
+            inner: Arc::new(config),
+        })
+    }
+
+    /// Builds a client config from native roots and a client certificate.
+    ///
+    /// The certificate is sent only when the server requests client
+    /// authentication.
+    pub fn with_native_roots_and_client_auth(
+        client_certs: Vec<CertificateDer<'static>>,
+        client_key: PrivateKeyDer<'static>,
+    ) -> Result<Self> {
+        Self::with_roots_and_client_auth(native_roots()?, client_certs, client_key)
+    }
+
+    /// Builds a client config from custom roots and a client certificate.
+    pub fn with_custom_roots_and_client_auth(
+        roots: Vec<CertificateDer<'static>>,
+        client_certs: Vec<CertificateDer<'static>>,
+        client_key: PrivateKeyDer<'static>,
+    ) -> Result<Self> {
+        Self::with_roots_and_client_auth(
+            root_store(roots, "custom root")?,
+            client_certs,
+            client_key,
+        )
+    }
+
+    fn with_roots_and_client_auth(
+        roots: RootCertStore,
+        client_certs: Vec<CertificateDer<'static>>,
+        client_key: PrivateKeyDer<'static>,
+    ) -> Result<Self> {
+        if client_certs.is_empty() {
+            return Err(Error::Config(
+                "at least one client certificate is required".to_owned(),
+            ));
+        }
+        let mut config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_client_auth_cert(client_certs, client_key)
+            .map_err(|e| Error::Config(e.to_string()))?;
+        config.alpn_protocols = vec![ALPN_PROTOCOL.to_vec()];
 
         Ok(Self {
             inner: Arc::new(config),
@@ -117,10 +186,42 @@ impl ServerConfig {
         certs: Vec<CertificateDer<'static>>,
         key: PrivateKeyDer<'static>,
     ) -> Result<Self> {
-        let config = rustls::ServerConfig::builder()
+        if certs.is_empty() {
+            return Err(Error::Config(
+                "at least one server certificate is required".to_owned(),
+            ));
+        }
+        let mut config = rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(certs, key)
             .map_err(|e| Error::Config(e.to_string()))?;
+        config.alpn_protocols = vec![ALPN_PROTOCOL.to_vec()];
+
+        Ok(Self {
+            inner: Arc::new(config),
+        })
+    }
+
+    /// Creates a server config that requires a trusted client certificate.
+    pub fn from_der_with_client_auth(
+        certs: Vec<CertificateDer<'static>>,
+        key: PrivateKeyDer<'static>,
+        client_roots: Vec<CertificateDer<'static>>,
+    ) -> Result<Self> {
+        if certs.is_empty() {
+            return Err(Error::Config(
+                "at least one server certificate is required".to_owned(),
+            ));
+        }
+        let client_roots = Arc::new(root_store(client_roots, "client root")?);
+        let verifier = WebPkiClientVerifier::builder(client_roots)
+            .build()
+            .map_err(|e| Error::Config(e.to_string()))?;
+        let mut config = rustls::ServerConfig::builder()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(certs, key)
+            .map_err(|e| Error::Config(e.to_string()))?;
+        config.alpn_protocols = vec![ALPN_PROTOCOL.to_vec()];
 
         Ok(Self {
             inner: Arc::new(config),
@@ -140,6 +241,47 @@ impl ServerConfig {
         let cfg = Self::from_der(vec![cert_der.clone()], key_der)?;
         Ok((cfg, cert_der))
     }
+}
+
+fn native_roots() -> Result<RootCertStore> {
+    let mut roots = RootCertStore::empty();
+    let cert_result = rustls_native_certs::load_native_certs();
+    for cert in cert_result.certs {
+        roots.add(cert).map_err(|e| Error::Config(e.to_string()))?;
+    }
+    if roots.is_empty() {
+        let details = cert_result
+            .errors
+            .first()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "the platform returned no certificates".to_owned());
+        return Err(Error::Config(format!(
+            "no usable native root certificates: {details}"
+        )));
+    }
+    if !cert_result.errors.is_empty() {
+        tracing::warn!(
+            errors = cert_result.errors.len(),
+            "some native root certificates could not be loaded"
+        );
+    }
+    Ok(roots)
+}
+
+fn root_store(
+    certs: Vec<CertificateDer<'static>>,
+    certificate_kind: &'static str,
+) -> Result<RootCertStore> {
+    if certs.is_empty() {
+        return Err(Error::Config(format!(
+            "at least one {certificate_kind} certificate is required"
+        )));
+    }
+    let mut roots = RootCertStore::empty();
+    for cert in certs {
+        roots.add(cert).map_err(|e| Error::Config(e.to_string()))?;
+    }
+    Ok(roots)
 }
 
 #[derive(Debug)]

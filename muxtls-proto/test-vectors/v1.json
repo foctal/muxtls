@@ -1,0 +1,97 @@
+{
+  "schema_version": 1,
+  "protocol": "muxtls/1",
+  "varints": [
+    { "name": "zero", "value": 0, "encoded": "00" },
+    { "name": "one_byte_max", "value": 63, "encoded": "3f" },
+    { "name": "two_byte_min", "value": 64, "encoded": "4040" },
+    { "name": "two_byte_max", "value": 16383, "encoded": "7fff" },
+    { "name": "four_byte_min", "value": 16384, "encoded": "80004000" },
+    { "name": "four_byte_max", "value": 1073741823, "encoded": "bfffffff" },
+    { "name": "eight_byte_min", "value": 1073741824, "encoded": "c000000040000000" },
+    { "name": "maximum", "value": 4611686018427387903, "encoded": "ffffffffffffffff" }
+  ],
+  "frames": [
+    {
+      "name": "ping",
+      "encoded": "02",
+      "length_prefixed": "0000000102",
+      "frame": { "type": "ping" }
+    },
+    {
+      "name": "open_client_stream_zero",
+      "encoded": "0400",
+      "length_prefixed": "000000020400",
+      "frame": { "type": "open_stream", "stream_id": 0 }
+    },
+    {
+      "name": "open_server_stream_one",
+      "encoded": "0401",
+      "length_prefixed": "000000020401",
+      "frame": { "type": "open_stream", "stream_id": 1 }
+    },
+    {
+      "name": "open_final_odd_stream",
+      "encoded": "04ffffffffffffffff",
+      "length_prefixed": "0000000904ffffffffffffffff",
+      "frame": { "type": "open_stream", "stream_id": 4611686018427387903 }
+    },
+    {
+      "name": "stream_hello",
+      "encoded": "0000000568656c6c6f",
+      "length_prefixed": "000000090000000568656c6c6f",
+      "frame": {
+        "type": "stream",
+        "stream_id": 0,
+        "fin": false,
+        "payload": "68656c6c6f"
+      }
+    },
+    {
+      "name": "stream_empty_fin",
+      "encoded": "00010100",
+      "length_prefixed": "0000000400010100",
+      "frame": {
+        "type": "stream",
+        "stream_id": 1,
+        "fin": true,
+        "payload": ""
+      }
+    },
+    {
+      "name": "reset_stream",
+      "encoded": "0140402a",
+      "length_prefixed": "000000040140402a",
+      "frame": {
+        "type": "reset_stream",
+        "stream_id": 64,
+        "error_code": 42
+      }
+    },
+    {
+      "name": "graceful_connection_close",
+      "encoded": "030004646f6e65",
+      "length_prefixed": "00000007030004646f6e65",
+      "frame": {
+        "type": "connection_close",
+        "error_code": 0,
+        "reason": "done"
+      }
+    }
+  ],
+  "invalid_varints": [
+    { "name": "empty", "encoded": "", "error": "unexpected_eof" },
+    { "name": "truncated_two_byte", "encoded": "40", "error": "unexpected_eof" },
+    { "name": "truncated_four_byte", "encoded": "800000", "error": "unexpected_eof" },
+    { "name": "truncated_eight_byte", "encoded": "c0000000000000", "error": "unexpected_eof" }
+  ],
+  "invalid_frames": [
+    { "name": "empty", "encoded": "", "error": "unexpected_eof" },
+    { "name": "unknown_type", "encoded": "ff", "error": "unknown_frame_type" },
+    { "name": "ping_with_trailing_byte", "encoded": "02ff", "error": "trailing_bytes" },
+    { "name": "reserved_stream_flag", "encoded": "00000200", "error": "unsupported_flags" },
+    { "name": "truncated_stream_payload", "encoded": "0000000501", "error": "unexpected_eof" },
+    { "name": "invalid_close_utf8", "encoded": "030001ff", "error": "invalid_utf8" },
+    { "name": "truncated_open_stream_id", "encoded": "0440", "error": "varint_unexpected_eof" }
+  ]
+}

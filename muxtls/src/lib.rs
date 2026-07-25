@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! `muxtls` provides multiplexed bidirectional streams over TLS/TCP.
 //!
 //! The crate offers a small async transport API:
@@ -38,8 +40,12 @@ mod limits;
 mod stream;
 
 pub use config::{ClientConfig, ServerConfig};
-pub use connection::{Connection, ConnectionStats};
+pub use connection::{Connection, ConnectionStats, PeerIdentity};
 pub use endpoint::{Connecting, Endpoint};
 pub use error::{Error, Result};
 pub use limits::Limits;
 pub use stream::{RecvStream, SendStream};
+
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub use connection::fuzz_connection_state;

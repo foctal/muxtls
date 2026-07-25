@@ -20,6 +20,7 @@ pub struct SendStream {
     write_fut: Option<WriteFuture>,
     write_len: usize,
     shutdown_fut: Option<WriteFuture>,
+    shutdown_complete: bool,
 }
 
 /// Readable half of a bidirectional stream.
@@ -43,6 +44,7 @@ impl Clone for SendStream {
             write_fut: None,
             write_len: 0,
             shutdown_fut: None,
+            shutdown_complete: false,
         }
     }
 }
@@ -76,6 +78,7 @@ impl SendStream {
             write_fut: None,
             write_len: 0,
             shutdown_fut: None,
+            shutdown_complete: false,
         }
     }
 
@@ -198,7 +201,7 @@ impl AsyncWrite for SendStream {
             return Poll::Ready(Ok(0));
         }
 
-        if this.shutdown_fut.is_some() {
+        if this.shutdown_fut.is_some() || this.shutdown_complete {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "stream already shut down",
@@ -206,7 +209,14 @@ impl AsyncWrite for SendStream {
         }
 
         if this.write_fut.is_none() {
-            let chunk = Bytes::copy_from_slice(buf);
+            let max_payload = this.shared.max_stream_payload(this.stream_id);
+            if max_payload == 0 {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "max frame size cannot encode stream data",
+                )));
+            }
+            let chunk = Bytes::copy_from_slice(&buf[..buf.len().min(max_payload)]);
             this.write_len = chunk.len();
             let shared = this.shared.clone();
             let state = this.state.clone();
@@ -257,6 +267,9 @@ impl AsyncWrite for SendStream {
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        if this.shutdown_complete {
+            return Poll::Ready(Ok(()));
+        }
 
         if let Some(fut) = this.write_fut.as_mut() {
             match fut.as_mut().poll(cx) {
@@ -288,6 +301,7 @@ impl AsyncWrite for SendStream {
         match fut.as_mut().poll(cx) {
             Poll::Ready(Ok(())) => {
                 this.shutdown_fut = None;
+                this.shutdown_complete = true;
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(Err(err)) => {

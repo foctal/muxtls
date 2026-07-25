@@ -14,6 +14,9 @@ pub enum Error {
     #[error("tls error: {0}")]
     Tls(#[from] rustls::Error),
 
+    #[error("TLS handshake failed: {0}")]
+    TlsHandshake(String),
+
     #[error("invalid dns name: {0}")]
     InvalidDnsName(String),
 
@@ -28,6 +31,20 @@ pub enum Error {
 
     #[error("limit exceeded: {0}")]
     LimitExceeded(String),
+
+    #[error("invalid limit `{field}`: {reason}")]
+    InvalidLimit {
+        /// Name of the invalid [`crate::Limits`] field.
+        field: &'static str,
+        /// Explanation of the accepted range or relationship.
+        reason: String,
+    },
+
+    #[error("{0} timed out")]
+    Timeout(&'static str),
+
+    #[error("stream identifier space exhausted")]
+    StreamIdExhausted,
 
     #[error("connection closed")]
     ConnectionClosed,

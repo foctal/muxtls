@@ -2,6 +2,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use muxtls::{ClientConfig, Endpoint, Limits, ServerConfig};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
 use tracing_subscriber::EnvFilter;
 
@@ -100,7 +102,7 @@ async fn oversized_frame_is_rejected() {
     let (server_cfg, cert) = ServerConfig::self_signed_for_localhost().expect("self-signed cert");
 
     let limits = Limits {
-        max_frame_size: 8,
+        max_frame_size: 32,
         max_open_streams: 8,
         max_inbound_connection_bytes: 1024,
         max_outbound_connection_bytes: 1024,
@@ -129,7 +131,7 @@ async fn oversized_frame_is_rejected() {
 
     let (send, _recv) = conn.open_bi().await.expect("open stream");
     let err = send
-        .write_chunk(Bytes::from_static(b"012345678"))
+        .write_chunk(Bytes::from(vec![0; 29]))
         .await
         .expect_err("oversized chunk must fail");
 
@@ -141,4 +143,434 @@ async fn oversized_frame_is_rejected() {
 
     let _ = conn.close("done").await;
     let _ = timeout(Duration::from_secs(2), server_task).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn async_write_splits_buffers_at_frame_boundaries() {
+    let (server_cfg, cert) = ServerConfig::self_signed_for_localhost().expect("self-signed cert");
+    let limits = Limits {
+        max_frame_size: 64,
+        max_open_streams: 8,
+        max_inbound_connection_bytes: 16 * 1024,
+        max_outbound_connection_bytes: 16 * 1024,
+        max_inbound_stream_bytes: 8 * 1024,
+        max_outbound_stream_bytes: 8 * 1024,
+    };
+    let server = Endpoint::server("127.0.0.1:0", server_cfg)
+        .await
+        .expect("bind server")
+        .with_limits(limits.clone());
+    let addr = server.local_addr().expect("server address");
+
+    let server_task = tokio::spawn(async move {
+        let conn = server.accept().await.expect("accept");
+        let (mut send, mut recv) = conn.accept_bi().await.expect("accept stream");
+        tokio::io::copy(&mut recv, &mut send).await.expect("echo");
+        send.shutdown().await.expect("shutdown echo");
+    });
+
+    let client =
+        Endpoint::client(ClientConfig::with_custom_roots(vec![cert]).expect("client config"))
+            .with_limits(limits);
+    let conn = client
+        .connect(addr, "localhost")
+        .expect("start connect")
+        .await
+        .expect("connect");
+    let (mut send, mut recv) = conn.open_bi().await.expect("open stream");
+    let payload = vec![0x5a; 4096];
+
+    send.write_all(&payload).await.expect("write all");
+    send.shutdown().await.expect("shutdown");
+    send.shutdown()
+        .await
+        .expect("repeated shutdown is idempotent");
+
+    let mut received = Vec::new();
+    recv.read_to_end(&mut received).await.expect("read echo");
+    assert_eq!(received, payload);
+
+    conn.close("done").await.expect("close");
+    timeout(Duration::from_secs(2), conn.wait_closed())
+        .await
+        .expect("connection close timeout");
+    server_task.await.expect("server task");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invalid_limits_fail_before_connecting() {
+    let limits = Limits {
+        max_open_streams: 0,
+        ..Limits::default()
+    };
+    let endpoint = Endpoint::client(ClientConfig::dangerous_insecure_no_verify_for_testing())
+        .with_limits(limits);
+    let addr = "127.0.0.1:9".parse().expect("socket address");
+
+    let error = match endpoint.connect(addr, "localhost") {
+        Ok(_) => panic!("invalid limits must fail"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        muxtls::Error::InvalidLimit {
+            field: "max_open_streams",
+            ..
+        }
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn server_tls_handshake_times_out() {
+    let (server_cfg, _) = ServerConfig::self_signed_for_localhost().expect("self-signed cert");
+    let server = Endpoint::server("127.0.0.1:0", server_cfg)
+        .await
+        .expect("bind server")
+        .with_handshake_timeout(Duration::from_millis(50));
+    let addr = server.local_addr().expect("server address");
+
+    let accept_task = tokio::spawn(async move { server.accept().await });
+    let _tcp = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("raw TCP connect");
+    let result = timeout(Duration::from_secs(1), accept_task)
+        .await
+        .expect("accept did not observe handshake timeout")
+        .expect("accept task");
+    let error = match result {
+        Ok(_) => panic!("non-TLS client must time out"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, muxtls::Error::Timeout("TLS handshake")));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reset_before_stream_data_is_delivered() {
+    let (server_cfg, cert) = ServerConfig::self_signed_for_localhost().expect("self-signed cert");
+    let server = Endpoint::server("127.0.0.1:0", server_cfg)
+        .await
+        .expect("bind server");
+    let addr = server.local_addr().expect("server address");
+
+    let server_task = tokio::spawn(async move {
+        let conn = server.accept().await.expect("accept");
+        let (_send, recv) = conn.accept_bi().await.expect("accept reset stream");
+        let error = recv
+            .read_chunk()
+            .await
+            .expect_err("reset must reach receiver");
+        assert!(matches!(error, muxtls::Error::StreamReset(42)));
+    });
+
+    let client =
+        Endpoint::client(ClientConfig::with_custom_roots(vec![cert]).expect("client config"));
+    let conn = client
+        .connect(addr, "localhost")
+        .expect("start connect")
+        .await
+        .expect("connect");
+    let (send, _recv) = conn.open_bi().await.expect("open stream");
+    send.reset(42).await.expect("reset stream");
+
+    timeout(Duration::from_secs(2), server_task)
+        .await
+        .expect("server timeout")
+        .expect("server task");
+    conn.close("done").await.expect("close");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn server_rejects_tls_without_muxtls_alpn() {
+    let (server_cfg, cert) = ServerConfig::self_signed_for_localhost().expect("self-signed cert");
+    let server = Endpoint::server("127.0.0.1:0", server_cfg)
+        .await
+        .expect("bind server");
+    let addr = server.local_addr().expect("server address");
+    let accept_task = tokio::spawn(async move { server.accept().await });
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(cert).expect("add test root");
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let tcp = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("TCP connect");
+    let server_name = rustls::pki_types::ServerName::try_from("localhost")
+        .expect("server name")
+        .to_owned();
+    let _tls = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config))
+        .connect(server_name, tcp)
+        .await
+        .expect("base TLS handshake");
+
+    let result = accept_task.await.expect("accept task");
+    let error = match result {
+        Ok(_) => panic!("missing ALPN must be rejected"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, muxtls::Error::TlsHandshake(message) if message.contains("ALPN")));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropping_last_connection_handle_closes_the_peer() {
+    let (server_cfg, cert) = ServerConfig::self_signed_for_localhost().expect("self-signed cert");
+    let server = Endpoint::server("127.0.0.1:0", server_cfg)
+        .await
+        .expect("bind server");
+    let addr = server.local_addr().expect("server address");
+    let server_task = tokio::spawn(async move {
+        let conn = server.accept().await.expect("accept");
+        timeout(Duration::from_secs(2), conn.wait_closed())
+            .await
+            .expect("peer drop did not close connection");
+        assert!(conn.is_closed());
+    });
+
+    let client =
+        Endpoint::client(ClientConfig::with_custom_roots(vec![cert]).expect("client config"));
+    let conn = client
+        .connect(addr, "localhost")
+        .expect("start connect")
+        .await
+        .expect("connect");
+    drop(conn);
+
+    server_task.await.expect("server task");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbound_buffer_violation_closes_instead_of_blocking_reader() {
+    let (server_cfg, cert) = ServerConfig::self_signed_for_localhost().expect("self-signed cert");
+    let server_limits = Limits {
+        max_frame_size: 64,
+        max_open_streams: 8,
+        max_inbound_connection_bytes: 1024,
+        max_outbound_connection_bytes: 1024,
+        max_inbound_stream_bytes: 32,
+        max_outbound_stream_bytes: 1024,
+    };
+    let server = Endpoint::server("127.0.0.1:0", server_cfg)
+        .await
+        .expect("bind server")
+        .with_limits(server_limits);
+    let addr = server.local_addr().expect("server address");
+    let server_task = tokio::spawn(async move {
+        let conn = server.accept().await.expect("accept");
+        timeout(Duration::from_secs(2), conn.wait_closed())
+            .await
+            .expect("inbound limit did not close connection");
+    });
+
+    let client_limits = Limits {
+        max_frame_size: 64,
+        max_open_streams: 8,
+        max_inbound_connection_bytes: 1024,
+        max_outbound_connection_bytes: 1024,
+        max_inbound_stream_bytes: 1024,
+        max_outbound_stream_bytes: 1024,
+    };
+    let client =
+        Endpoint::client(ClientConfig::with_custom_roots(vec![cert]).expect("client config"))
+            .with_limits(client_limits);
+    let conn = client
+        .connect(addr, "localhost")
+        .expect("start connect")
+        .await
+        .expect("connect");
+    let (send, _recv) = conn.open_bi().await.expect("open stream");
+    send.write_chunk(Bytes::from(vec![0; 40]))
+        .await
+        .expect("queue oversized-for-peer chunk");
+
+    timeout(Duration::from_secs(2), conn.wait_closed())
+        .await
+        .expect("client did not observe protocol close");
+    server_task.await.expect("server task");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn keepalive_frames_prevent_idle_timeout() {
+    let (server_cfg, cert) = ServerConfig::self_signed_for_localhost().expect("self-signed cert");
+    let keepalive = Duration::from_millis(20);
+    let idle_timeout = Duration::from_millis(100);
+    let server = Endpoint::server("127.0.0.1:0", server_cfg)
+        .await
+        .expect("bind server")
+        .with_keepalive_interval(keepalive)
+        .with_idle_timeout(idle_timeout);
+    let addr = server.local_addr().expect("server address");
+    let server_task = tokio::spawn(async move {
+        let conn = server.accept().await.expect("accept");
+        tokio::time::sleep(Duration::from_millis(180)).await;
+        assert!(!conn.is_closed());
+        assert!(conn.stats().frames_received > 0);
+        conn.wait_closed().await;
+    });
+
+    let client =
+        Endpoint::client(ClientConfig::with_custom_roots(vec![cert]).expect("client config"))
+            .with_keepalive_interval(keepalive)
+            .with_idle_timeout(idle_timeout);
+    let conn = client
+        .connect(addr, "localhost")
+        .expect("start connect")
+        .await
+        .expect("connect");
+
+    tokio::time::sleep(Duration::from_millis(180)).await;
+    assert!(!conn.is_closed());
+    let stats = conn.stats();
+    assert!(stats.frames_sent > 0);
+    assert!(stats.frames_received > 0);
+
+    conn.close("done").await.expect("close");
+    timeout(Duration::from_secs(2), server_task)
+        .await
+        .expect("server timeout")
+        .expect("server task");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn idle_timeout_closes_a_silent_connection() {
+    let (server_cfg, cert) = ServerConfig::self_signed_for_localhost().expect("self-signed cert");
+    let server = Endpoint::server("127.0.0.1:0", server_cfg)
+        .await
+        .expect("bind server")
+        .with_idle_timeout(Duration::from_millis(50));
+    let addr = server.local_addr().expect("server address");
+    let server_task = tokio::spawn(async move {
+        let conn = server.accept().await.expect("accept");
+        timeout(Duration::from_secs(2), conn.wait_closed())
+            .await
+            .expect("server idle timeout did not fire");
+        assert!(conn.is_closed());
+    });
+
+    let client =
+        Endpoint::client(ClientConfig::with_custom_roots(vec![cert]).expect("client config"));
+    let conn = client
+        .connect(addr, "localhost")
+        .expect("start connect")
+        .await
+        .expect("connect");
+
+    timeout(Duration::from_secs(2), conn.wait_closed())
+        .await
+        .expect("client did not observe idle close");
+    assert!(conn.is_closed());
+    server_task.await.expect("server task");
+}
+
+#[tokio::test]
+async fn zero_connection_policy_durations_are_rejected() {
+    let endpoint = Endpoint::client(ClientConfig::dangerous_insecure_no_verify_for_testing())
+        .with_keepalive_interval(Duration::ZERO);
+    let addr = "127.0.0.1:9".parse().expect("socket address");
+    let error = match endpoint.connect(addr, "localhost") {
+        Ok(_) => panic!("zero keepalive interval must fail"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, muxtls::Error::Config(message) if message.contains("keepalive")));
+
+    let endpoint = Endpoint::client(ClientConfig::dangerous_insecure_no_verify_for_testing())
+        .with_idle_timeout(Duration::ZERO);
+    let error = match endpoint.connect(addr, "localhost") {
+        Ok(_) => panic!("zero idle timeout must fail"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, muxtls::Error::Config(message) if message.contains("idle")));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mutual_tls_exposes_verified_peer_certificates() {
+    let server_identity =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_owned(), "127.0.0.1".to_owned()])
+            .expect("server identity");
+    let server_cert = server_identity.cert.der().clone();
+    let server_key =
+        PrivateKeyDer::try_from(server_identity.signing_key.serialize_der()).expect("server key");
+
+    let client_identity = rcgen::generate_simple_self_signed(vec!["client.local".to_owned()])
+        .expect("client identity");
+    let client_cert: CertificateDer<'static> = client_identity.cert.der().clone();
+    let client_key =
+        PrivateKeyDer::try_from(client_identity.signing_key.serialize_der()).expect("client key");
+
+    let server_config = ServerConfig::from_der_with_client_auth(
+        vec![server_cert.clone()],
+        server_key,
+        vec![client_cert.clone()],
+    )
+    .expect("mTLS server config");
+    let server = Endpoint::server("127.0.0.1:0", server_config)
+        .await
+        .expect("bind server");
+    let addr = server.local_addr().expect("server address");
+    let expected_client_cert = client_cert.clone();
+    let server_task = tokio::spawn(async move {
+        let conn = server.accept().await.expect("authenticated client");
+        let identity = conn.peer_identity().expect("client identity");
+        assert_eq!(identity.certificates(), &[expected_client_cert]);
+        conn.wait_closed().await;
+    });
+
+    let client_config = ClientConfig::with_custom_roots_and_client_auth(
+        vec![server_cert],
+        vec![client_cert],
+        client_key,
+    )
+    .expect("mTLS client config");
+    let conn = Endpoint::client(client_config)
+        .connect(addr, "localhost")
+        .expect("start connect")
+        .await
+        .expect("connect");
+    assert!(
+        conn.peer_identity()
+            .is_some_and(|identity| !identity.certificates().is_empty())
+    );
+
+    conn.close("done").await.expect("close");
+    timeout(Duration::from_secs(2), server_task)
+        .await
+        .expect("server timeout")
+        .expect("server task");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mutual_tls_rejects_clients_without_certificates() {
+    let server_identity =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_owned(), "127.0.0.1".to_owned()])
+            .expect("server identity");
+    let server_cert = server_identity.cert.der().clone();
+    let server_key =
+        PrivateKeyDer::try_from(server_identity.signing_key.serialize_der()).expect("server key");
+    let trusted_client = rcgen::generate_simple_self_signed(vec!["client.local".to_owned()])
+        .expect("trusted client identity");
+
+    let server_config = ServerConfig::from_der_with_client_auth(
+        vec![server_cert.clone()],
+        server_key,
+        vec![trusted_client.cert.der().clone()],
+    )
+    .expect("mTLS server config");
+    let server = Endpoint::server("127.0.0.1:0", server_config)
+        .await
+        .expect("bind server");
+    let addr = server.local_addr().expect("server address");
+    let server_task = tokio::spawn(async move { server.accept().await });
+
+    let client_config = ClientConfig::with_custom_roots(vec![server_cert]).expect("client roots");
+    let client_result = Endpoint::client(client_config)
+        .connect(addr, "localhost")
+        .expect("start connect")
+        .await;
+    let server_result = server_task.await.expect("server task");
+
+    assert!(client_result.is_err() || server_result.is_err());
+    assert!(
+        server_result.is_err(),
+        "server must reject anonymous clients"
+    );
 }
