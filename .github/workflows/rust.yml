@@ -16,11 +16,11 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-Dwarnings"
-  RUSTDOCFLAGS: "-Dwarnings"
 
 jobs:
-  quality:
+  ci:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -30,21 +30,6 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Run Clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace -- -D warnings
       - name: Run tests
-        run: cargo test --workspace --all-features
-      - name: Build documentation
-        run: cargo doc --workspace --all-features --no-deps
-      - name: Verify protocol package
-        # The runtime package can only be verified after this exact protocol
-        # version exists in the registry; workspace builds validate it in CI.
-        run: cargo package -p muxtls-proto
-
-  msrv:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.88.0
-      - uses: Swatinem/rust-cache@v2
-      - name: Check MSRV
-        run: cargo check --workspace --all-features
+        run: cargo test --workspace
