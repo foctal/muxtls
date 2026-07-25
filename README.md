@@ -7,12 +7,6 @@
 
 Multiplexed streams over TLS/TCP
 
-> **Status:** The runtime has bounded buffers, strict protocol validation, ALPN,
-> and connection/handshake shutdown handling. Review the remaining release
-> gates in
-> [`TODO.md`](https://github.com/foctal/muxtls/blob/main/TODO.md) before exposing
-> it to untrusted Internet peers.
-
 ## Features
 - TLS-secured client/server transport using `rustls` + `tokio-rustls`
 - Protocol isolation through the `muxtls/1` ALPN identifier
@@ -38,7 +32,7 @@ Multiplexed streams over TLS/TCP
 
 ```toml
 [dependencies]
-muxtls = "0.2"
+muxtls = "0.3"
 ```
 
 API documentation is available on [docs.rs][doc-url].  
@@ -71,10 +65,4 @@ explicit custom roots) in deployed services.
 
 For mutual TLS, use the client `*_and_client_auth` constructors and
 `ServerConfig::from_der_with_client_auth`, then inspect the verified certificate
-chain with `Connection::peer_identity`. Certificate rotation, session
-resumption, and identity-mapping guidance is in [`SECURITY.md`](SECURITY.md).
-
-## Fuzzing
-
-Coverage-guided fuzz targets for protocol decoding and connection state
-transitions are documented in [`fuzz/README.md`](fuzz/README.md).
+chain with `Connection::peer_identity`.
