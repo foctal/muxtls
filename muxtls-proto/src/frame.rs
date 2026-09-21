@@ -50,6 +50,32 @@ pub enum Frame {
         /// Stream identifier.
         stream_id: VarInt,
     },
+    /// Negotiates initial receive windows and maximum encoded frame size.
+    Settings {
+        /// Initial connection receive limit.
+        max_data: VarInt,
+        /// Initial receive limit for each stream.
+        max_stream_data: VarInt,
+        /// Maximum encoded frame size accepted by this endpoint.
+        max_frame_size: VarInt,
+    },
+    /// Raises the absolute connection payload limit.
+    MaxData {
+        /// Absolute payload limit.
+        maximum: VarInt,
+    },
+    /// Raises the absolute payload limit for a stream.
+    MaxStreamData {
+        /// Previously opened stream identifier.
+        stream_id: VarInt,
+        /// Absolute payload limit.
+        maximum: VarInt,
+    },
+    /// Requests cancellation of the peer's sending direction.
+    StopSending {
+        /// Previously opened stream identifier.
+        stream_id: VarInt,
+    },
     /// A liveness probe with no payload.
     Ping,
     /// Closes the entire connection.
@@ -81,6 +107,19 @@ impl Frame {
                 error_code,
             } => Ok(1 + stream_id.encoded_len() + error_code.encoded_len()),
             Self::OpenStream { stream_id } => Ok(1 + stream_id.encoded_len()),
+            Self::Settings {
+                max_data,
+                max_stream_data,
+                max_frame_size,
+            } => Ok(1
+                + max_data.encoded_len()
+                + max_stream_data.encoded_len()
+                + max_frame_size.encoded_len()),
+            Self::MaxData { maximum } => Ok(1 + maximum.encoded_len()),
+            Self::MaxStreamData { stream_id, maximum } => {
+                Ok(1 + stream_id.encoded_len() + maximum.encoded_len())
+            }
+            Self::StopSending { stream_id } => Ok(1 + stream_id.encoded_len()),
             Self::Ping => Ok(1),
             Self::ConnectionClose { error_code, reason } => {
                 let reason_len = VarInt::from_u64(
@@ -118,6 +157,29 @@ impl Frame {
             }
             Frame::OpenStream { stream_id } => {
                 out.put_u8(0x04);
+                stream_id.encode(out);
+            }
+            Frame::Settings {
+                max_data,
+                max_stream_data,
+                max_frame_size,
+            } => {
+                out.put_u8(0x05);
+                max_data.encode(out);
+                max_stream_data.encode(out);
+                max_frame_size.encode(out);
+            }
+            Frame::MaxData { maximum } => {
+                out.put_u8(0x06);
+                maximum.encode(out);
+            }
+            Frame::MaxStreamData { stream_id, maximum } => {
+                out.put_u8(0x07);
+                stream_id.encode(out);
+                maximum.encode(out);
+            }
+            Frame::StopSending { stream_id } => {
+                out.put_u8(0x08);
                 stream_id.encode(out);
             }
             Frame::Ping => out.put_u8(0x02),
@@ -189,6 +251,21 @@ impl Frame {
                 Frame::ConnectionClose { error_code, reason }
             }
             0x04 => Frame::OpenStream {
+                stream_id: VarInt::decode(src)?,
+            },
+            0x05 => Frame::Settings {
+                max_data: VarInt::decode(src)?,
+                max_stream_data: VarInt::decode(src)?,
+                max_frame_size: VarInt::decode(src)?,
+            },
+            0x06 => Frame::MaxData {
+                maximum: VarInt::decode(src)?,
+            },
+            0x07 => Frame::MaxStreamData {
+                stream_id: VarInt::decode(src)?,
+                maximum: VarInt::decode(src)?,
+            },
+            0x08 => Frame::StopSending {
                 stream_id: VarInt::decode(src)?,
             },
             other => return Err(ProtoError::UnknownFrameType(other)),

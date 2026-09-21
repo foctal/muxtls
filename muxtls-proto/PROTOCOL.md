@@ -6,7 +6,8 @@ This document defines the `muxtls/1` wire protocol. The key words **MUST**,
 Version 1 multiplexes ordered bidirectional streams over one TLS-protected TCP
 connection. TLS provides confidentiality, integrity, authentication according
 to the deployment's TLS configuration, and reliable ordered delivery. muxtls
-provides stream identification, framing, and stream lifecycle signaling.
+provides stream identification, framing, stream lifecycle signaling, and
+connection-level and stream-level receive-credit flow control.
 
 ## Version identification
 
@@ -50,8 +51,9 @@ Each record consists of:
 
 `Frame Length` is an unsigned 32-bit big-endian integer. It counts the complete
 inner frame and excludes the four-byte prefix. Empty inner frames are invalid.
-An implementation MAY enforce a lower local maximum frame length, but version 1
-does not advertise that limit to its peer.
+Each endpoint advertises its maximum inner frame length in SETTINGS.
+Subsequent frames MUST respect the peer's advertised maximum. SETTINGS itself
+fits within the minimum supported frame size of 25 bytes.
 
 Exactly one inner frame follows each length prefix. A truncated prefix,
 truncated frame, or trailing byte inside an inner frame is a connection error.
@@ -67,6 +69,10 @@ The first byte of every inner frame is its frame type.
 | `0x02` | `PING` | Indicates connection activity |
 | `0x03` | `CONNECTION_CLOSE` | Terminates the connection |
 | `0x04` | `OPEN_STREAM` | Announces a new bidirectional stream |
+| `0x05` | `SETTINGS` | Advertises initial receive credit and maximum frame size |
+| `0x06` | `MAX_DATA` | Increases the connection receive-credit limit |
+| `0x07` | `MAX_STREAM_DATA` | Increases a stream receive-credit limit |
+| `0x08` | `STOP_SENDING` | Requests termination of the peer's send direction |
 
 Unknown frame types are connection errors. Frame definitions below are shown
 without the four-byte record length.
@@ -131,6 +137,50 @@ Type (0x04) | Stream ID (varint)
 `OPEN_STREAM` creates one bidirectional stream. It MUST precede every `STREAM`
 or `RESET_STREAM` frame carrying that stream ID.
 
+### SETTINGS (`0x05`)
+
+```text
+Type (0x05) | Initial Max Data (varint) |
+Initial Max Stream Data (varint) | Max Frame Size (varint)
+```
+
+SETTINGS MUST be the first frame and MUST occur exactly once in each direction.
+Initial credit MAY be zero. Max Frame Size counts the inner frame, excluding the
+record prefix, and MUST be between 25 and `2^32 - 1`. No DATA credit is available
+before receiving SETTINGS.
+
+### MAX_DATA (`0x06`)
+
+```text
+Type (0x06) | Maximum Data (varint)
+```
+
+Maximum Data is the absolute cumulative payload limit for the sending direction
+of the entire connection, including retired streams.
+
+### MAX_STREAM_DATA (`0x07`)
+
+```text
+Type (0x07) | Stream ID (varint) | Maximum Stream Data (varint)
+```
+
+Maximum Stream Data is the absolute cumulative payload limit for the peer's
+send direction of that stream. Duplicate or decreasing credit updates are
+ignored. Updates for unopened streams are errors; updates for retired,
+previously issued streams are ignored. See [FLOW_CONTROL.md](FLOW_CONTROL.md)
+for accounting and bounded update rules.
+
+### STOP_SENDING (`0x08`)
+
+```text
+Type (0x08) | Stream ID (varint)
+```
+
+STOP_SENDING requests that the peer stop its send direction. The peer discards
+unscheduled payload and sends RESET_STREAM unless FIN or RESET_STREAM was
+already dispatched. Duplicate requests and requests for retired streams are
+ignored; requests for unopened streams are errors.
+
 ## Stream identifiers
 
 Client-initiated stream IDs are even and begin at 0. Server-initiated stream IDs
@@ -162,8 +212,10 @@ another terminal frame for a terminal direction is a connection error.
 
 ## Connection state and error handling
 
-A connection begins in `Open` after TLS and ALPN negotiation. Either endpoint
-may send frames while it remains open. Sending or receiving
+After TLS and ALPN negotiation, each endpoint sends SETTINGS as its first
+frame. A peer frame before SETTINGS or duplicate SETTINGS is a connection
+error. Application payload is sent only after peer settings have arrived and
+both stream and connection credit permit it. Sending or receiving
 `CONNECTION_CLOSE`, a framing failure, a protocol violation, a configured
 resource-limit violation, transport EOF, or a local idle timeout moves the
 connection to `Closed`.
@@ -175,17 +227,17 @@ close frame because abrupt transport loss is always possible.
 
 ## Flow control and resource limits
 
-Version 1 defines no protocol-level stream or connection flow-control window.
-Local buffer and stream limits are not advertised. An implementation that
-cannot buffer a valid incoming frame MAY close the connection with code one.
-Applications should configure compatible limits on both endpoints.
+Every payload byte MUST fit within both the stream's and the connection's
+advertised absolute limits. Consumption or explicit discard returns receive
+capacity; the endpoint advertises additional credit through MAX_DATA and
+MAX_STREAM_DATA. Credit arithmetic MUST NOT wrap. Empty FIN and control frames
+do not consume DATA credit. A legitimate temporary lack of credit blocks DATA
+transmission rather than terminating the connection.
 
-TCP flow control still applies to the entire connection, but it cannot prevent
-one logical stream from consuming a peer's configured per-stream buffer.
-
-A protocol-level flow-control design is specified separately in
-[`FLOW_CONTROL.md`](FLOW_CONTROL.md). It requires a future `muxtls/2` ALPN
-identifier because version 1 cannot add the necessary frames compatibly.
+[FLOW_CONTROL.md](FLOW_CONTROL.md) defines accounting, bounded update rules,
+scheduling fairness, configurable resource limits, and the runtime's finite
+graceful shutdown and cancellation contracts. It forms part of this version 1
+specification.
 
 ## Compatibility policy
 

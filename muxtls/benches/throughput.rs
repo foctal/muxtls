@@ -1,56 +1,64 @@
-use std::sync::Arc;
-
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use muxtls::{ClientConfig, Connection, Endpoint, ServerConfig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::runtime::Runtime;
 
 async fn setup_connection() -> Connection {
-    let (server_cfg, cert) = ServerConfig::self_signed_for_localhost().expect("self-signed cert");
-    let server = Endpoint::server("127.0.0.1:0", server_cfg)
-        .await
-        .expect("bind server");
-    let addr = server.local_addr().expect("server local address");
-
+    let (server_cfg, cert) = ServerConfig::self_signed_for_localhost().unwrap();
+    let server = Endpoint::server("127.0.0.1:0", server_cfg).await.unwrap();
+    let addr = server.local_addr().unwrap();
     tokio::spawn(async move {
-        let conn = server.accept().await.expect("accept connection");
+        let conn = server.accept().await.unwrap();
         while let Ok((mut send, mut recv)) = conn.accept_bi().await {
             tokio::spawn(async move {
-                let _ = tokio::io::copy(&mut recv, &mut send).await;
-                let _ = send.shutdown().await;
+                tokio::io::copy(&mut recv, &mut send).await.unwrap();
+                send.shutdown().await.unwrap();
             });
         }
     });
-
-    let client_cfg = ClientConfig::with_custom_roots(vec![cert]).expect("client roots");
-    let client = Endpoint::client(client_cfg);
-    client
+    Endpoint::client(ClientConfig::with_custom_roots(vec![cert]).unwrap())
         .connect(addr, "localhost")
-        .expect("start connect")
+        .unwrap()
         .await
-        .expect("connect")
+        .unwrap()
 }
 
 fn bench_stream_roundtrip(c: &mut Criterion) {
-    let runtime = Arc::new(Runtime::new().expect("tokio runtime"));
-    let connection = runtime.block_on(setup_connection());
-    let payload = vec![42u8; 16 * 1024];
-
-    c.bench_function("stream_roundtrip_16k", |b| {
-        let runtime = runtime.clone();
-        let conn = connection.clone();
-        b.to_async(runtime.as_ref()).iter(|| async {
-            let (mut send, mut recv) = conn.open_bi().await.expect("open stream");
-
-            send.write_all(&payload).await.expect("write payload");
-            send.shutdown().await.expect("finish send");
-
-            let mut received = Vec::with_capacity(payload.len());
-            recv.read_to_end(&mut received).await.expect("read echo");
-            assert_eq!(received.len(), payload.len(), "echo size mismatch");
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut group = c.benchmark_group("tls_stream_roundtrip");
+    group.sample_size(10);
+    group.warm_up_time(std::time::Duration::from_secs(1));
+    group.measurement_time(std::time::Duration::from_secs(2));
+    for (streams, size) in [(1, 64), (1, 16 * 1024), (1, 256 * 1024), (8, 16 * 1024)] {
+        let connection = runtime.block_on(setup_connection());
+        let payload = vec![42u8; size];
+        group.throughput(Throughput::Bytes((streams * size) as u64));
+        group.bench_with_input(
+            BenchmarkId::new(format!("{streams}_streams"), size),
+            &size,
+            |b, _| {
+                b.to_async(&runtime).iter(|| async {
+                    let operations = (0..streams).map(|_| async {
+                        let (mut send, mut recv) = connection.open_bi().await.unwrap();
+                        send.write_all(&payload).await.unwrap();
+                        send.shutdown().await.unwrap();
+                        let mut received = Vec::with_capacity(size);
+                        recv.read_to_end(&mut received).await.unwrap();
+                        assert_eq!(received, payload);
+                    });
+                    futures_util::future::join_all(operations).await;
+                });
+            },
+        );
+        runtime.block_on(async {
+            connection.close("benchmark done").await.unwrap();
+            connection.wait_closed().await;
         });
-    });
+    }
+    group.finish();
 }
-
 criterion_group!(benches, bench_stream_roundtrip);
 criterion_main!(benches);

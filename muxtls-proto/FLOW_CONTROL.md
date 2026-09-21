@@ -1,135 +1,153 @@
-# Protocol-Level Flow Control Design
+# muxtls/1 flow control and cancellation
 
-This document specifies the flow-control design for a future `muxtls/2` wire
-protocol. It is intentionally not added to `muxtls/1`: version 1 rejects
-unknown frame types and has no extension negotiation, so adding the required
-frames under the existing ALPN identifier would be incompatible.
+This document defines the receive-credit accounting, resource limits, and
+runtime lifecycle contracts for protocol version 1. The record framing,
+integer encoding, frame layouts, and connection state rules are specified in
+[PROTOCOL.md](PROTOCOL.md). Peers MUST negotiate `muxtls/1`.
+Conformance vectors for all frame types are in `test-vectors/v1.json`.
 
-## Goals
+## Frames
 
-- Bound unread data independently for each stream.
-- Bound total unread data for a connection.
-- Backpressure one stream without blocking frame processing for other streams.
-- Keep control frames sendable when all data credit is exhausted.
-- Avoid credit-reclamation ambiguity after reset or stream retirement.
-- Permit different receive limits at each endpoint.
+All fields below are unsigned QUIC variable-length integers (at most 2^62-1).
+Control frames consume no DATA credit.
 
-Flow control limits application payload bytes only. Frame headers, TLS records,
-and implementation queues require separate bounded-memory limits.
+| Type | Name | Fields after type |
+| --- | --- | --- |
+| 0x05 | SETTINGS | Initial Max Data, Initial Max Stream Data, Max Frame Size |
+| 0x06 | MAX_DATA | Maximum Data |
+| 0x07 | MAX_STREAM_DATA | Stream ID, Maximum Stream Data |
+| 0x08 | STOP_SENDING | Stream ID |
 
-## Version negotiation
+SETTINGS MUST be the first frame and MUST occur exactly once in each direction.
+Initial credits MAY be zero. Max Frame Size MUST be between 25 and 2^32-1,
+including the inner frame header, excluding the four-byte record prefix.
+Local default configurations advertise positive windows. Before receiving
+SETTINGS, a sender has zero DATA credit. A stream starts with the peer's initial
+stream limit, regardless of which endpoint opened it. OPEN MUST precede all
+controls and DATA referencing that stream.
 
-An implementation of this design MUST negotiate the ALPN identifier
-`muxtls/2`. A version 1 endpoint MUST continue to use `muxtls/1` and the
-disconnect-on-buffer-exhaustion behavior defined by the version 1 protocol.
+MAX_DATA and MAX_STREAM_DATA are absolute lifetime payload limits, not deltas.
+Duplicate or decreasing updates MUST be ignored. An update for a future,
+unopened stream is a connection error. An update for a retired, previously
+issued stream is ignored: delayed updates can legitimately cross FIN/RESET.
+Issued IDs are validated by parity and the next-issued counter; no unbounded
+retired-stream set is needed. A peer limit never causes allocation or increases
+local buffer budgets.
 
-Version 2 retains the version 1 record prefix, integer encoding, stream ID
-allocation, and frame layouts unless this document changes them.
+## Accounting and ordering
 
-## Flow-control frames
+Each sending direction tracks total serialized payload bytes. Connection
+accounting is the sum across every stream, including retired streams. DATA MUST
+satisfy both the connection and stream limits. The sole writer spends credit
+when taking DATA from a queue for serialization, not when application code
+queues a chunk. It splits chunks at the remaining credit and peer frame limit.
+No sender may reserve all connection credit while waiting for stream credit.
+FIN with no payload requires no credit; it remains ordered after queued DATA.
 
-The following frame type assignments are reserved for version 2.
+The receiver MUST check both cumulative end offsets before accepting payload.
+Exceeding either limit is a connection error, without wrapping an integer.
+Updates saturate at 2^62-1. Reaching this lifetime limit prevents further DATA;
+applications must replace that connection. It cannot wrap into new credit.
 
-| Type | Name | Encoding |
-| ---: | --- | --- |
-| `0x05` | `SETTINGS` | Type, Initial Max Data, Initial Max Stream Data |
-| `0x06` | `MAX_DATA` | Type, Maximum Data |
-| `0x07` | `MAX_STREAM_DATA` | Type, Stream ID, Maximum Stream Data |
+RESET discards unscheduled local DATA and queues one reset frame. DATA already
+handed to the writer remains before RESET on the ordered transport and counts
+at both endpoints. There is no final-offset ambiguity because unscheduled DATA
+never spent peer credit. A dispatched FIN cannot be replaced by RESET.
 
-All numeric fields are variable-length integers. Flow-control frames are
-control frames and are not themselves subject to flow-control credit.
+Dropping an unfinished receive direction discards its buffered bytes and queues
+STOP_SENDING. Receiving STOP_SENDING cancels pending writes, discards unscheduled
+DATA, and sends RESET unless FIN or RESET was already dispatched. No further
+stream credit is advertised for a discarded receive direction. Connection
+credit is returned for all discarded bytes, including already authorized DATA
+arriving before the peer observes STOP_SENDING. Duplicate STOP_SENDING is safe;
+unknown future stream IDs are errors, and retired IDs are ignored.
 
-### SETTINGS
+## Consumption and bounded updates
 
-Each endpoint MUST send exactly one `SETTINGS` frame as its first inner frame.
-Receiving any other frame before `SETTINGS`, or receiving a second `SETTINGS`,
-is a connection error.
+Received bytes remain charged while in the inbound queue or an AsyncRead
+remainder. Copying bytes to the caller, returning a chunk, or explicit discard
+returns the corresponding permits and increments consumed totals exactly once.
+A receive window advertises `min(consumed + capacity, 2^62-1)` after at least
+half a window has been consumed since the last update. If advertised credit is
+exhausted, any newly freed capacity triggers an update, even below the normal
+threshold: otherwise one active stream smaller than half the connection window
+could deadlock behind stalled streams. Receive and consumption transitions both
+wake the writer when this exception applies. This can require a credit frame
+per read for a peer making one-byte progress at exhaustion; that traffic is
+necessary for progress and still coalesces in one bounded window state.
+No timers or per-read frame allocations are needed. The final
+saturating update is allowed below the half-window threshold.
 
-`Initial Max Data` is the total number of stream payload bytes the peer may
-send across the connection. `Initial Max Stream Data` is the number of payload
-bytes the peer may initially send on each stream, regardless of which endpoint
-opened it. Both values are absolute offsets and MAY be zero.
+Credit updates are synthesized from window state, rather than appended to an
+unbounded queue. There is one connection window and at most one registered
+window per admitted stream. Ordinary controls have an explicit finite capacity;
+PING coalesces. At least `3 * max_open_streams + 2` control slots are required
+for OPEN, RESET, STOP_SENDING and SETTINGS/PING. Arithmetic is checked.
 
-An implementation SHOULD send limits no larger than its actual inbound buffer
-capacity. Local connection and stream limits continue to apply even if a peer
-advertises larger values for the opposite direction.
+The writer round-robins eligible streams and skips uncredited streams. Control
+work alternates with DATA; queued OPEN and SETTINGS precede dependent frames.
+A blocked stream cannot monopolize scheduling or reserve connection credit.
+Isolation requires connection capacity larger than the stalled stream's window;
+no protocol can provide progress after all shared capacity is genuinely occupied.
+TCP packet loss and a peer that stops reading the entire socket still cause
+connection-wide head-of-line blocking.
 
-### MAX_DATA
+Payload semaphores and explicit connection/stream outbound frame-count
+semaphores bound queues. Each stream gets at most
+`max_queued_outbound_frames / max_open_streams` slots; validation requires at
+least one slot per stream. A stalled stream cannot occupy the entire metadata
+budget with one-byte writes.
+Small inbound frames coalesce into pages of at most 16 KiB (or one configured
+stream window when smaller); frames of at least half a page retain zero-copy
+ownership. Queue metadata is therefore bounded by page count plus active
+streams, rather than one entry per peer-controlled byte. An unfinished page
+can reserve at most one page of spare capacity per stream. Read-chunk boundaries
+are implementation-defined byte boundaries, not preserved message boundaries. Empty non-FIN DATA is not queued. Incoming stream handles are
+bounded by `max_open_streams`. Decoded/sending frames add at most one configured
+frame per I/O direction beyond queued byte budgets. Application-owned returned
+buffers and retained stream handles remain the application's responsibility.
 
-`Maximum Data` increases the absolute connection-level payload offset the peer
-may send. Values lower than or equal to the previously advertised maximum have
-no effect and MUST NOT be treated as errors.
+## Local lifecycle and API contracts
 
-### MAX_STREAM_DATA
+`close` publishes graceful shutdown atomically, rejecting new operations and
+waking admission waiters. The connection-owned supervisor applies
+`Limits::drain_timeout` (default five seconds; configurable in (0, one hour]).
+It drains queued DATA/controls, then sends CLOSE. If the peer will not read or
+will not provide credit, the deadline aborts I/O. Cancellation of `close` before
+publication does nothing; after publication shutdown belongs to the supervisor.
+Dropping the last connection handle invokes the same finite drain policy.
+`abort` requests immediate termination. `wait_closed` waits for the joined
+reader, writer, keepalive and stream-cleanup task group and transport release.
+It does not wait for application-owned stream handles to be dropped.
 
-`Maximum Stream Data` increases the absolute payload offset the peer may send
-on the identified stream. The stream MUST already have been announced with
-`OPEN_STREAM`. A frame for an unknown or retired stream is a connection error.
-Values lower than or equal to the previously advertised maximum have no effect.
+Stream cleanup uses one connection-owned worker, not one spawned task per drop.
+Accept does not hold a queue lock while awaiting arrival; a suspended accept
+future cannot block shutdown. No dequeue-to-return cancellation point exists.
+Open acquires admission/queue resources before assigning an ID and publishing
+OPEN. Cancellation before publication cannot leak IDs or permits.
 
-## Accounting
+Each stream direction selects chunk operations or AsyncRead/AsyncWrite at first
+use. Mixing them returns an explicit error. Stream halves are not Clone: one
+AsyncWrite buffer and one AsyncRead remainder have unique owners, preventing
+another clone from overtaking accepted data with FIN or abandoning a remainder. Flushing
+does not change that selection. AsyncWrite owns and acknowledges at most one
+bounded chunk per handle; a subsequent call drains that chunk before accepting
+new bytes and never reports an old buffer's length. Flush publishes accepted
+bytes to the bounded connection queue; it does not promise peer consumption.
+Use AsyncWrite shutdown after AsyncWrite, and `finish` after chunk writes.
+Dropped unfinished send handles reset the direction. A successfully queued FIN
+survives handle drop. Explicit reset can cancel a queued, undispatched FIN.
+Received bytes and FIN remain readable through a retained receive handle after
+connection shutdown; clearing connection bookkeeping must not discard bytes
+already accepted for an application. EOF and reset remain terminal. Cancelling a pending read consumes no data.
+EOF/terminal completion and protocol offsets do not depend on application
+futures being repolled after shutdown.
 
-Every stream direction has a zero-based sent offset and advertised maximum.
-The end offset of a `STREAM` frame is:
+## Verification
 
-```text
-previous stream end offset + Payload Length
-```
-
-A sender MUST NOT emit a frame whose end offset exceeds the peer's current
-stream maximum. Across all streams, the sum of every payload byte ever sent
-MUST NOT exceed the peer's current connection maximum.
-
-A receiver MUST validate both limits before making payload available to the
-application. Exceeding either advertised maximum is a connection error.
-
-Payload bytes count once when received. They remain counted at connection
-level after FIN, reset, discard, or stream retirement. This prevents a peer
-from resetting streams to reclaim credit for bytes the receiver did not
-consume. Empty `STREAM` frames and FIN consume no credit.
-
-## Credit updates and application reads
-
-Credit is returned only after the application consumes or explicitly discards
-buffered payload. Implementations SHOULD use a sliding window:
-
-1. Track consumed connection and stream offsets.
-2. When remaining credit falls below an implementation-defined threshold,
-   advance the advertised maximum by the amount consumed.
-3. Queue `MAX_DATA` or `MAX_STREAM_DATA` without waiting for data-frame credit.
-
-Updates SHOULD be coalesced to avoid one control frame per application read.
-An implementation MUST continue processing control frames while a stream has
-no send credit. A blocked write MUST wake when relevant credit increases or
-the stream or connection becomes terminal.
-
-When the receive handle is discarded, the implementation MAY discard buffered
-payload and advertise corresponding connection credit. It MUST NOT advertise
-additional stream credit for that discarded direction.
-
-## Concurrency and ordering
-
-Credit updates are monotonically increasing, so reordered writer-queue
-operations cannot reduce credit. The sender MUST reserve connection and stream
-credit atomically with respect to other writes before enqueueing a `STREAM`
-frame. Canceling before enqueue releases the reservation; canceling after
-enqueue does not.
-
-Connection close, stream reset, and FIN retain the version 1 terminal ordering
-rules. Flow-control waiters MUST be woken on all terminal transitions.
-
-## Required conformance coverage
-
-A version 2 implementation is not complete until tests cover:
-
-- zero initial windows followed by credit updates;
-- exact-boundary writes and one-byte connection and stream overruns;
-- independent progress on a credited stream while another is blocked;
-- duplicate and decreasing updates;
-- unknown and retired stream IDs in `MAX_STREAM_DATA`;
-- FIN and reset while a write is waiting for credit;
-- aggregate connection accounting across stream churn;
-- discarded unread data and credit coalescing;
-- cancellation before and after credit reservation;
-- maximum variable-length integer offsets and overflow handling.
-
+The runtime regressions cover stalled-stream fairness, smaller peer windows,
+partial-read accounting, reset ordering, STOP_SENDING, duplicate/extreme credit,
+cancelled publication, blocked-operation release, simultaneous close and joined
+transport teardown. Window tests cover coalescing, exact limits and saturation.
+The state-machine fuzzer includes flow-control frames and raw malformed frames. These
+bounded tests are evidence, not a proof of universal correctness.

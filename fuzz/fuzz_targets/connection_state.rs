@@ -14,6 +14,21 @@ struct Scenario {
 
 #[derive(Arbitrary, Debug)]
 enum Action {
+    Settings {
+        data: u64,
+        stream: u64,
+        frame: u64,
+    },
+    MaxData {
+        maximum: u64,
+    },
+    MaxStreamData {
+        index: u8,
+        maximum: u64,
+    },
+    StopSending {
+        index: u8,
+    },
     OpenNext,
     Open {
         stream_id: u64,
@@ -49,10 +64,33 @@ enum Action {
 fuzz_target!(|scenario: Scenario| {
     let mut next_remote_id = if scenario.is_client { 1 } else { 0 };
     let mut opened = Vec::new();
-    let mut encoded_frames = Vec::new();
+    let mut encoded_frames = vec![encode(Frame::Settings {
+        max_data: varint(4096),
+        max_stream_data: varint(512),
+        max_frame_size: varint(1024),
+    })];
 
     for action in scenario.actions.into_iter().take(64) {
         let encoded = match action {
+            Action::Settings {
+                data,
+                stream,
+                frame,
+            } => encode(Frame::Settings {
+                max_data: varint(bounded(data)),
+                max_stream_data: varint(bounded(stream)),
+                max_frame_size: varint(bounded(frame)),
+            }),
+            Action::MaxData { maximum } => encode(Frame::MaxData {
+                maximum: varint(bounded(maximum)),
+            }),
+            Action::MaxStreamData { index, maximum } => encode(Frame::MaxStreamData {
+                stream_id: varint(select(&opened, index).copied().unwrap_or(VarInt::MAX)),
+                maximum: varint(bounded(maximum)),
+            }),
+            Action::StopSending { index } => encode(Frame::StopSending {
+                stream_id: varint(select(&opened, index).copied().unwrap_or(VarInt::MAX)),
+            }),
             Action::OpenNext => {
                 if next_remote_id > VarInt::MAX {
                     continue;
