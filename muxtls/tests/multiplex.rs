@@ -413,11 +413,15 @@ async fn keepalive_frames_prevent_idle_timeout() {
         .with_keepalive_interval(keepalive)
         .with_idle_timeout(idle_timeout);
     let addr = server.local_addr().expect("server address");
+    let (checked_tx, checked_rx) = tokio::sync::oneshot::channel();
     let server_task = tokio::spawn(async move {
         let conn = server.accept().await.expect("accept");
         tokio::time::sleep(Duration::from_millis(180)).await;
         assert!(!conn.is_closed());
         assert!(conn.stats().frames_received > 0);
+        checked_tx
+            .send(())
+            .expect("client waiting for server assertions");
         conn.wait_closed().await;
     });
 
@@ -437,6 +441,11 @@ async fn keepalive_frames_prevent_idle_timeout() {
     assert!(stats.frames_sent > 0);
     assert!(stats.frames_received > 0);
 
+    // Both peers must check liveness before either initiates normal shutdown.
+    timeout(Duration::from_secs(2), checked_rx)
+        .await
+        .expect("server liveness check timeout")
+        .expect("server liveness check");
     conn.close("done").await.expect("close");
     timeout(Duration::from_secs(2), server_task)
         .await
