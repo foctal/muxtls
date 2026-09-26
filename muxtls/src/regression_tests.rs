@@ -304,13 +304,19 @@ async fn repeated_flow_control_cancellation_and_shutdown_stress() {
     let start = std::time::Instant::now();
     let mut frames = 0;
     for cycle in 0..20_000 {
+        if cycle % 1_000 == 0 {
+            eprintln!(
+                "STRESS progress cycles={cycle} elapsed={:?}",
+                start.elapsed()
+            );
+        }
         let (a, b) = pair();
         let weak_a = Arc::downgrade(&a.shared);
         let weak_b = Arc::downgrade(&b.shared);
         let (mut send, _recv) = a.open_bi().await.unwrap();
         let (_send, mut recv) = b.accept_bi().await.unwrap();
         let payload = vec![(cycle % 251) as u8; 4096];
-        tokio::time::timeout(Duration::from_secs(2), async {
+        let transfer = tokio::time::timeout(Duration::from_secs(2), async {
             let ((), received) = tokio::join!(
                 async {
                     send.write_all(&payload).await.unwrap();
@@ -324,8 +330,33 @@ async fn repeated_flow_control_cancellation_and_shutdown_stress() {
             );
             assert_eq!(received, payload);
         })
-        .await
-        .unwrap();
+        .await;
+        if transfer.is_err() {
+            for (label, conn) in [("a", &a), ("b", &b)] {
+                let queues = conn.shared.writer.queues.lock().await;
+                eprintln!(
+                    "STALL cycle={cycle} side={label} stats={:?} peer_limit={} sent={} ready={:?} controls={:?}",
+                    conn.stats(),
+                    queues.peer_limit,
+                    queues.sent,
+                    queues.ready,
+                    queues.control
+                );
+                drop(queues);
+                for (id, state) in conn.shared.streams.lock().await.iter() {
+                    eprintln!(
+                        "STREAM {id} sent={} peer_limit={} received={} recv_terminal={} send_terminal={} dispatched={}",
+                        state.sent.load(Ordering::Acquire),
+                        state.peer_limit.load(Ordering::Acquire),
+                        state.receive_window.received.load(Ordering::Acquire),
+                        state.recv_terminal.load(Ordering::Acquire),
+                        state.send_terminal.load(Ordering::Acquire),
+                        state.send_dispatched.load(Ordering::Acquire)
+                    );
+                }
+            }
+        }
+        transfer.unwrap();
         frames += a.stats().frames_sent + b.stats().frames_sent;
         a.abort();
         b.abort();
