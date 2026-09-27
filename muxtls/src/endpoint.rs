@@ -209,16 +209,36 @@ impl Endpoint {
     }
 
     fn validate_connection_policy(&self) -> Result<()> {
-        if self.keepalive_interval == Some(Duration::ZERO) {
-            return Err(Error::Config(
-                "keepalive interval must be greater than zero".to_owned(),
-            ));
-        }
-        if self.idle_timeout == Some(Duration::ZERO) {
-            return Err(Error::Config(
-                "idle timeout must be greater than zero".to_owned(),
-            ));
+        for (name, value) in [
+            ("handshake timeout", Some(self.handshake_timeout)),
+            ("keepalive interval", self.keepalive_interval),
+            ("idle timeout", self.idle_timeout),
+        ] {
+            if let Some(value) = value
+                && (value.is_zero() || tokio::time::Instant::now().checked_add(value).is_none())
+            {
+                return Err(Error::Config(format!(
+                    "{name} must be positive and representable by the monotonic clock"
+                )));
+            }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn invalid_timeouts_are_rejected_before_connecting() {
+        let (_, cert) = crate::ServerConfig::self_signed_for_localhost().unwrap();
+        let config = ClientConfig::with_custom_roots(vec![cert]).unwrap();
+        for endpoint in [
+            Endpoint::client(config.clone()).with_handshake_timeout(Duration::ZERO),
+            Endpoint::client(config.clone()).with_keepalive_interval(Duration::MAX),
+            Endpoint::client(config).with_idle_timeout(Duration::ZERO),
+        ] {
+            assert!(endpoint.validate_connection_policy().is_err());
+        }
     }
 }

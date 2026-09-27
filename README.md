@@ -32,7 +32,7 @@ Multiplexed streams over TLS/TCP
 
 ```toml
 [dependencies]
-muxtls = "0.3"
+muxtls = "0.4"
 ```
 
 API documentation is available on [docs.rs][doc-url].  
@@ -42,18 +42,15 @@ API documentation is available on [docs.rs][doc-url].
 `muxtls` uses a four-byte big-endian length prefix followed by a frame encoded
 by `muxtls-proto`. Client-initiated stream IDs are even, server-initiated stream
 IDs are odd, and each side announces IDs monotonically with `OPEN_STREAM`.
-See the
-[`muxtls-proto/PROTOCOL.md`](https://github.com/foctal/muxtls/blob/main/muxtls-proto/PROTOCOL.md)
-document for the complete version 1 specification and the
-[`v1.json`](https://github.com/foctal/muxtls/blob/main/muxtls-proto/test-vectors/v1.json)
-file for language-independent conformance vectors.
+See [the version 1 specification](muxtls-proto/PROTOCOL.md) and
+[version 1 conformance vectors](muxtls-proto/test-vectors/v1.json).
 
-Supported frame types:
-- `OPEN_STREAM`
-- `STREAM`
-- `RESET_STREAM`
-- `PING`
-- `CONNECTION_CLOSE`
+Supported frame types include OPEN_STREAM, STREAM, RESET_STREAM, PING,
+CONNECTION_CLOSE, SETTINGS, MAX_DATA, MAX_STREAM_DATA and STOP_SENDING.
+Connection and stream credit propagate backpressure to the peer. Graceful close
+has a finite configurable drain deadline, immediate abort is available, and
+`wait_closed` waits for transport/task release. Choose chunk operations or
+AsyncRead/AsyncWrite per stream direction; mixing them returns an error.
 
 ## Examples
 - `cargo run -p muxtls --example echo_server`

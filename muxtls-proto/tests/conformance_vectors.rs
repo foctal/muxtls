@@ -49,6 +49,21 @@ enum ExpectedFrame {
     OpenStream {
         stream_id: u64,
     },
+    Settings {
+        max_data: u64,
+        max_stream_data: u64,
+        max_frame_size: u64,
+    },
+    MaxData {
+        maximum: u64,
+    },
+    MaxStreamData {
+        stream_id: u64,
+        maximum: u64,
+    },
+    StopSending {
+        stream_id: u64,
+    },
     Ping,
     ConnectionClose {
         error_code: u64,
@@ -58,10 +73,13 @@ enum ExpectedFrame {
 
 #[test]
 fn version_one_conformance_vectors_match_codec() {
-    let vectors = load_vectors();
-    assert_eq!(vectors.schema_version, 1);
+    let vectors: Vectors = serde_json::from_str(include_str!("../test-vectors/v1.json")).unwrap();
     assert_eq!(vectors.protocol, "muxtls/1");
+    check_vectors(vectors);
+}
 
+fn check_vectors(vectors: Vectors) {
+    assert_eq!(vectors.schema_version, 1);
     for vector in vectors.varints {
         let expected = decode_hex(&vector.encoded, &vector.name);
         let value = VarInt::from_u64(vector.value).expect("vector value must fit");
@@ -128,11 +146,6 @@ fn version_one_conformance_vectors_match_codec() {
     }
 }
 
-fn load_vectors() -> Vectors {
-    serde_json::from_str(include_str!("../test-vectors/v1.json"))
-        .expect("version one vectors must be valid JSON")
-}
-
 fn expected_frame(frame: ExpectedFrame, name: &str) -> Frame {
     match frame {
         ExpectedFrame::Stream {
@@ -154,6 +167,25 @@ fn expected_frame(frame: ExpectedFrame, name: &str) -> Frame {
         ExpectedFrame::OpenStream { stream_id } => Frame::OpenStream {
             stream_id: VarInt::from_u64(stream_id).expect("stream id must fit"),
         },
+        ExpectedFrame::Settings {
+            max_data,
+            max_stream_data,
+            max_frame_size,
+        } => Frame::Settings {
+            max_data: VarInt::from_u64(max_data).unwrap(),
+            max_stream_data: VarInt::from_u64(max_stream_data).unwrap(),
+            max_frame_size: VarInt::from_u64(max_frame_size).unwrap(),
+        },
+        ExpectedFrame::MaxData { maximum } => Frame::MaxData {
+            maximum: VarInt::from_u64(maximum).unwrap(),
+        },
+        ExpectedFrame::MaxStreamData { stream_id, maximum } => Frame::MaxStreamData {
+            stream_id: VarInt::from_u64(stream_id).unwrap(),
+            maximum: VarInt::from_u64(maximum).unwrap(),
+        },
+        ExpectedFrame::StopSending { stream_id } => Frame::StopSending {
+            stream_id: VarInt::from_u64(stream_id).unwrap(),
+        },
         ExpectedFrame::Ping => Frame::Ping,
         ExpectedFrame::ConnectionClose { error_code, reason } => Frame::ConnectionClose {
             error_code: ErrorCode::from_u64(error_code).expect("error code must fit"),
@@ -166,7 +198,9 @@ fn decode_hex(encoded: &str, name: &str) -> Vec<u8> {
     assert_eq!(encoded.len() % 2, 0, "odd hex length: {name}");
     encoded
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             let pair = std::str::from_utf8(pair).expect("hex must be ASCII");
             u8::from_str_radix(pair, 16).unwrap_or_else(|_| panic!("invalid hex in {name}"))

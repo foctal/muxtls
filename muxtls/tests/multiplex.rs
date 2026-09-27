@@ -29,6 +29,7 @@ async fn multiplexed_streams_are_isolated_and_ordered() {
         max_outbound_connection_bytes: 1024 * 1024,
         max_inbound_stream_bytes: 128 * 1024,
         max_outbound_stream_bytes: 128 * 1024,
+        ..Limits::default()
     };
 
     let server = Endpoint::server("127.0.0.1:0", server_cfg)
@@ -81,7 +82,9 @@ async fn multiplexed_streams_are_isolated_and_ordered() {
                 received.push(chunk);
             }
 
-            assert_eq!(sent, received, "stream payload ordering mismatch");
+            let sent: Vec<u8> = sent.into_iter().flatten().collect();
+            let received: Vec<u8> = received.into_iter().flatten().collect();
+            assert_eq!(sent, received, "stream byte ordering mismatch");
         }));
     }
 
@@ -108,6 +111,7 @@ async fn oversized_frame_is_rejected() {
         max_outbound_connection_bytes: 1024,
         max_inbound_stream_bytes: 256,
         max_outbound_stream_bytes: 256,
+        ..Limits::default()
     };
 
     let server = Endpoint::server("127.0.0.1:0", server_cfg)
@@ -155,6 +159,7 @@ async fn async_write_splits_buffers_at_frame_boundaries() {
         max_outbound_connection_bytes: 16 * 1024,
         max_inbound_stream_bytes: 8 * 1024,
         max_outbound_stream_bytes: 8 * 1024,
+        ..Limits::default()
     };
     let server = Endpoint::server("127.0.0.1:0", server_cfg)
         .await
@@ -340,7 +345,7 @@ async fn dropping_last_connection_handle_closes_the_peer() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn inbound_buffer_violation_closes_instead_of_blocking_reader() {
+async fn smaller_peer_receive_window_backpressures_without_disconnect() {
     let (server_cfg, cert) = ServerConfig::self_signed_for_localhost().expect("self-signed cert");
     let server_limits = Limits {
         max_frame_size: 64,
@@ -349,6 +354,7 @@ async fn inbound_buffer_violation_closes_instead_of_blocking_reader() {
         max_outbound_connection_bytes: 1024,
         max_inbound_stream_bytes: 32,
         max_outbound_stream_bytes: 1024,
+        ..Limits::default()
     };
     let server = Endpoint::server("127.0.0.1:0", server_cfg)
         .await
@@ -357,9 +363,15 @@ async fn inbound_buffer_violation_closes_instead_of_blocking_reader() {
     let addr = server.local_addr().expect("server address");
     let server_task = tokio::spawn(async move {
         let conn = server.accept().await.expect("accept");
-        timeout(Duration::from_secs(2), conn.wait_closed())
-            .await
-            .expect("inbound limit did not close connection");
+        let (_send, recv) = conn.accept_bi().await.expect("accept stream");
+        let mut bytes = Vec::new();
+        while bytes.len() < 40 {
+            bytes.extend_from_slice(&recv.read_chunk().await.expect("receive").expect("data"));
+        }
+        assert_eq!(bytes, vec![0; 40]);
+        assert!(!conn.is_closed());
+        conn.close("done").await.expect("close");
+        conn.wait_closed().await;
     });
 
     let client_limits = Limits {
@@ -369,6 +381,7 @@ async fn inbound_buffer_violation_closes_instead_of_blocking_reader() {
         max_outbound_connection_bytes: 1024,
         max_inbound_stream_bytes: 1024,
         max_outbound_stream_bytes: 1024,
+        ..Limits::default()
     };
     let client =
         Endpoint::client(ClientConfig::with_custom_roots(vec![cert]).expect("client config"))
@@ -385,7 +398,7 @@ async fn inbound_buffer_violation_closes_instead_of_blocking_reader() {
 
     timeout(Duration::from_secs(2), conn.wait_closed())
         .await
-        .expect("client did not observe protocol close");
+        .expect("client did not observe graceful close");
     server_task.await.expect("server task");
 }
 
@@ -400,11 +413,15 @@ async fn keepalive_frames_prevent_idle_timeout() {
         .with_keepalive_interval(keepalive)
         .with_idle_timeout(idle_timeout);
     let addr = server.local_addr().expect("server address");
+    let (checked_tx, checked_rx) = tokio::sync::oneshot::channel();
     let server_task = tokio::spawn(async move {
         let conn = server.accept().await.expect("accept");
         tokio::time::sleep(Duration::from_millis(180)).await;
         assert!(!conn.is_closed());
         assert!(conn.stats().frames_received > 0);
+        checked_tx
+            .send(())
+            .expect("client waiting for server assertions");
         conn.wait_closed().await;
     });
 
@@ -424,6 +441,11 @@ async fn keepalive_frames_prevent_idle_timeout() {
     assert!(stats.frames_sent > 0);
     assert!(stats.frames_received > 0);
 
+    // Both peers must check liveness before either initiates normal shutdown.
+    timeout(Duration::from_secs(2), checked_rx)
+        .await
+        .expect("server liveness check timeout")
+        .expect("server liveness check");
     conn.close("done").await.expect("close");
     timeout(Duration::from_secs(2), server_task)
         .await

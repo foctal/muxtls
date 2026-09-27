@@ -1,3 +1,4 @@
+use rustls::pki_types::pem::PemObject;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
@@ -163,7 +164,7 @@ impl ServerConfig {
     /// Loads a server certificate chain and private key from PEM files.
     pub fn from_pem_files(cert_path: impl AsRef<Path>, key_path: impl AsRef<Path>) -> Result<Self> {
         let mut cert_reader = BufReader::new(File::open(cert_path)?);
-        let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
+        let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_reader_iter(&mut cert_reader)
             .collect::<std::result::Result<_, _>>()
             .map_err(|e| Error::Config(e.to_string()))?;
 
@@ -174,9 +175,8 @@ impl ServerConfig {
         }
 
         let mut key_reader = BufReader::new(File::open(key_path)?);
-        let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_reader)
-            .map_err(|e| Error::Config(e.to_string()))?
-            .ok_or_else(|| Error::Config("no private key found in PEM file".to_owned()))?;
+        let key: PrivateKeyDer<'static> = PrivateKeyDer::from_pem_reader(&mut key_reader)
+            .map_err(|e| Error::Config(e.to_string()))?;
 
         Self::from_der(certs, key)
     }

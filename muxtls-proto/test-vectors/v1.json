@@ -77,6 +77,45 @@
         "error_code": 0,
         "reason": "done"
       }
+    },
+    {
+      "name": "settings_zero_credit",
+      "encoded": "0500004040",
+      "length_prefixed": "000000050500004040",
+      "frame": {
+        "type": "settings",
+        "max_data": 0,
+        "max_stream_data": 0,
+        "max_frame_size": 64
+      }
+    },
+    {
+      "name": "max_data_maximum",
+      "encoded": "06ffffffffffffffff",
+      "length_prefixed": "0000000906ffffffffffffffff",
+      "frame": {
+        "type": "max_data",
+        "maximum": 4611686018427387903
+      }
+    },
+    {
+      "name": "max_stream_data",
+      "encoded": "07004040",
+      "length_prefixed": "0000000407004040",
+      "frame": {
+        "type": "max_stream_data",
+        "stream_id": 0,
+        "maximum": 64
+      }
+    },
+    {
+      "name": "stop_sending",
+      "encoded": "0801",
+      "length_prefixed": "000000020801",
+      "frame": {
+        "type": "stop_sending",
+        "stream_id": 1
+      }
     }
   ],
   "invalid_varints": [
@@ -92,6 +131,9 @@
     { "name": "reserved_stream_flag", "encoded": "00000200", "error": "unsupported_flags" },
     { "name": "truncated_stream_payload", "encoded": "0000000501", "error": "unexpected_eof" },
     { "name": "invalid_close_utf8", "encoded": "030001ff", "error": "invalid_utf8" },
-    { "name": "truncated_open_stream_id", "encoded": "0440", "error": "varint_unexpected_eof" }
+    { "name": "truncated_open_stream_id", "encoded": "0440", "error": "varint_unexpected_eof" },
+    {"name": "truncated_settings", "encoded": "050000", "error": "varint_unexpected_eof"},
+    {"name": "trailing_credit", "encoded": "060000", "error": "trailing_bytes"},
+    {"name": "truncated_stream_credit", "encoded": "0700", "error": "varint_unexpected_eof"}
   ]
 }

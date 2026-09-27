@@ -8,9 +8,15 @@ use crate::{Error, Result};
 /// also validate limits before creating each connection.
 #[derive(Debug, Clone)]
 pub struct Limits {
+    /// Maximum graceful drain time before transport I/O is aborted.
+    pub drain_timeout: std::time::Duration,
+    /// Maximum queued DATA/FIN chunks, in addition to payload byte budgets.
+    pub max_queued_outbound_frames: usize,
+    /// Control frame capacity; at least three per open stream plus SETTINGS/PING.
+    pub max_control_frames: usize,
     /// Maximum encoded inner frame size, excluding the four-byte length prefix.
     pub max_frame_size: usize,
-    /// Maximum simultaneous open streams.
+    /// Maximum simultaneous open streams and queued incoming stream handles.
     pub max_open_streams: usize,
     /// Maximum total buffered inbound bytes per connection.
     pub max_inbound_connection_bytes: usize,
@@ -25,6 +31,9 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
+            drain_timeout: std::time::Duration::from_secs(5),
+            max_queued_outbound_frames: 1024,
+            max_control_frames: 512,
             max_frame_size: 64 * 1024,
             max_open_streams: 128,
             max_inbound_connection_bytes: 4 * 1024 * 1024,
@@ -37,10 +46,17 @@ impl Default for Limits {
 
 impl Limits {
     /// Smallest frame limit that can encode every control frame shape.
-    pub const MIN_FRAME_SIZE: usize = 17;
+    pub const MIN_FRAME_SIZE: usize = 25;
 
     /// Validates that all limits are nonzero and representable by the runtime.
     pub fn validate(&self) -> Result<()> {
+        if self.drain_timeout.is_zero() || self.drain_timeout > std::time::Duration::from_secs(3600)
+        {
+            return Err(invalid(
+                "drain_timeout",
+                "must be greater than zero and at most one hour",
+            ));
+        }
         if self.max_frame_size < Self::MIN_FRAME_SIZE {
             return Err(invalid(
                 "max_frame_size",
@@ -55,6 +71,28 @@ impl Limits {
         }
 
         validate_semaphore("max_open_streams", self.max_open_streams)?;
+        validate_semaphore(
+            "max_queued_outbound_frames",
+            self.max_queued_outbound_frames,
+        )?;
+        validate_semaphore("max_control_frames", self.max_control_frames)?;
+        if self.max_queued_outbound_frames < self.max_open_streams {
+            return Err(invalid(
+                "max_queued_outbound_frames",
+                "must allow at least one frame per admitted stream",
+            ));
+        }
+        let minimum_controls = self
+            .max_open_streams
+            .checked_mul(3)
+            .and_then(|n| n.checked_add(2))
+            .ok_or_else(|| invalid("max_open_streams", "control capacity overflow"))?;
+        if self.max_control_frames < minimum_controls {
+            return Err(invalid(
+                "max_control_frames",
+                "must be at least 3 * max_open_streams + 2",
+            ));
+        }
         validate_byte_limit(
             "max_inbound_connection_bytes",
             self.max_inbound_connection_bytes,

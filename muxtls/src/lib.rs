@@ -36,6 +36,7 @@ mod config;
 mod connection;
 mod endpoint;
 mod error;
+mod flow;
 mod limits;
 mod stream;
 
