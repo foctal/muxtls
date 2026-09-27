@@ -24,6 +24,59 @@ fn pair() -> (Connection, Connection) {
     )
 }
 
+#[tokio::test]
+async fn receiver_cleanup_waiting_on_writer_does_not_abort_graceful_close() {
+    let (io, _peer) = tokio::io::duplex(1);
+    let conn = Connection::new(io, limits(), true, None, None, None).unwrap();
+    let (_send, recv) = conn.open_bi().await.unwrap();
+    let guard = conn.shared.writer.queues.lock().await;
+    let mut close = Box::pin(conn.close("drain queued data"));
+    let mut cleanup = Box::pin(conn.shared.handle_last_recv_drop(recv.id(), &recv.state));
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(close.as_mut().poll(&mut cx).is_pending());
+    assert!(cleanup.as_mut().poll(&mut cx).is_pending());
+    drop(guard);
+    close.await.unwrap();
+    cleanup.await;
+    assert!(
+        !conn.shared.terminated.load(Ordering::Acquire),
+        "receiver cleanup must not interrupt graceful close"
+    );
+    conn.abort();
+    conn.wait_closed().await;
+}
+
+#[tokio::test]
+async fn keepalive_waiting_on_writer_does_not_abort_graceful_close() {
+    let (io, _peer) = tokio::io::duplex(1);
+    let config = Limits {
+        drain_timeout: Duration::from_secs(1),
+        ..limits()
+    };
+    let conn =
+        Connection::new(io, config, true, None, Some(Duration::from_millis(5)), None).unwrap();
+    let guard = conn.shared.writer.queues.lock().await;
+    let mut close = Box::pin(conn.close("drain queued data"));
+    assert!(
+        close
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending()
+    );
+    // Let a keepalive tick queue behind close on the writer mutex.
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    drop(guard);
+    close.await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), conn.wait_closed())
+            .await
+            .is_err(),
+        "a pending keepalive must not interrupt the drain deadline"
+    );
+    conn.abort();
+    conn.wait_closed().await;
+}
+
 async fn until(mut condition: impl FnMut() -> bool) {
     tokio::time::timeout(Duration::from_secs(2), async {
         while !condition() {

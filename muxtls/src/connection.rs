@@ -664,6 +664,7 @@ impl ConnectionShared {
                     stream_id: VarInt::from_u64(stream_id).expect("valid stream ID"),
                 })
                 .await
+            && !self.closed.load(Ordering::Acquire)
         {
             self.mark_closed().await;
         }
@@ -1546,7 +1547,11 @@ fn spawn_connection_tasks(
                 tokio::select! {
                     _ = ticker.tick() => {
                         if !keepalive_shared.writer.enqueue_control(Frame::Ping).await {
-                            keepalive_shared.mark_closed().await;
+                            // Graceful close may win while this tick waits for
+                            // the queue lock. Leave its drain policy in charge.
+                            if !keepalive_shared.closed.load(Ordering::Acquire) {
+                                keepalive_shared.mark_closed().await;
+                            }
                             break;
                         }
                     }
