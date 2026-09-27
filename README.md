@@ -32,7 +32,7 @@ Multiplexed streams over TLS/TCP
 
 ```toml
 [dependencies]
-muxtls = "0.3"
+muxtls = "0.4"
 ```
 
 API documentation is available on [docs.rs][doc-url].  
